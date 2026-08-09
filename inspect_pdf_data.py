@@ -26,6 +26,140 @@ def print_header(title: str):
     print("=" * 70)
 
 
+# ------------------------------------------------------------------
+# 5. Visual output + full operator dump (debug version)
+# ------------------------------------------------------------------
+def dump_and_plot_drawings(page, drawings, page_num, out_dir):
+    log_path = out_dir / f"page{page_num:02d}_drawings.txt"
+    with open(log_path, "w", encoding="utf-8") as log:
+        log.write(f"=== PAGE {page_num} – {len(drawings)} paths ===\n\n")
+
+        fig, ax = plt.subplots(1, 1, figsize=(14, 14 * page.rect.height / page.rect.width))
+        ax.set_xlim(page.rect.x0, page.rect.x1)
+        ax.set_ylim(page.rect.y1, page.rect.y0)  # PDF → matplotlib y-flip
+        ax.set_aspect("equal")
+        ax.set_title(f"Vector paths (numbered) – page {page_num}")
+        ax.axis("off")
+
+        global_op_id = 0          # unique ID for every single operator
+        path_id = 0
+
+        for path in drawings:
+            path_id += 1
+            color = path.get("color") or (0, 0, 0)
+            fill  = path.get("fill")
+            lw    = path.get("width") or 0.8
+            close = path.get("closePath", False)
+            ptype = path.get("type", "?")
+
+            header = (f"PATH {path_id:03d}  type={ptype}  closePath={close}  "
+                      f"color={color}  fill={fill}  width={lw}  rect={path.get('rect')}")
+            print(header)
+            log.write(header + "\n")
+
+            segments = []
+            first_pt = None
+            last_pt  = None
+
+            for item in path.get("items", []):
+                global_op_id += 1
+                op = item[0]
+                pts = item[1:]
+
+                # ---- log the operator ----
+                desc = f"  OP {global_op_id:04d}  {op}  {pts}"
+                print(desc)
+                log.write(desc + "\n")
+
+                # ---- turn into line segments ----
+                if op == "l":
+                    p1, p2 = pts
+                    segments.append([(p1.x, p1.y), (p2.x, p2.y)])
+                    if first_pt is None:
+                        first_pt = p1
+                    last_pt = p2
+                    # label
+                    mid = ((p1.x + p2.x)/2, (p1.y + p2.y)/2)
+                    ax.text(mid[0], mid[1], str(global_op_id), fontsize=6,
+                            color="red", ha="center", va="center",
+                            bbox=dict(boxstyle="round,pad=0.15", fc="yellow", alpha=0.7))
+
+                elif op == "re":
+                    r = pts[0]          # Rect
+                    segs = [
+                        [(r.x0, r.y0), (r.x1, r.y0)],
+                        [(r.x1, r.y0), (r.x1, r.y1)],
+                        [(r.x1, r.y1), (r.x0, r.y1)],
+                        [(r.x0, r.y1), (r.x0, r.y0)],
+                    ]
+                    segments.extend(segs)
+                    first_pt = fitz.Point(r.x0, r.y0)
+                    last_pt  = first_pt
+                    cx, cy = r.x0 + r.width/2, r.y0 + r.height/2
+                    ax.text(cx, cy, str(global_op_id), fontsize=6, color="red",
+                            ha="center", va="center",
+                            bbox=dict(boxstyle="round,pad=0.15", fc="yellow", alpha=0.7))
+
+                elif op == "c":                    # cubic Bézier
+                    p0, p1, p2, p3 = pts
+                    ts = np.linspace(0, 1, 16)
+                    curve = []
+                    for t in ts:
+                        x = (1-t)**3*p0.x + 3*(1-t)**2*t*p1.x + 3*(1-t)*t**2*p2.x + t**3*p3.x
+                        y = (1-t)**3*p0.y + 3*(1-t)**2*t*p1.y + 3*(1-t)*t**2*p2.y + t**3*p3.y
+                        curve.append((x, y))
+                    for a, b in zip(curve[:-1], curve[1:]):
+                        segments.append([a, b])
+                    if first_pt is None:
+                        first_pt = p0
+                    last_pt = p3
+                    mid = curve[len(curve)//2]
+                    ax.text(mid[0], mid[1], str(global_op_id), fontsize=6, color="red",
+                            ha="center", va="center",
+                            bbox=dict(boxstyle="round,pad=0.15", fc="yellow", alpha=0.7))
+
+                elif op == "qu":                   # ★ previously missing
+                    q = pts[0]                    # Quad
+                    segs = [
+                        [(q.ul.x, q.ul.y), (q.ur.x, q.ur.y)],
+                        [(q.ur.x, q.ur.y), (q.lr.x, q.lr.y)],
+                        [(q.lr.x, q.lr.y), (q.ll.x, q.ll.y)],
+                        [(q.ll.x, q.ll.y), (q.ul.x, q.ul.y)],
+                    ]
+                    segments.extend(segs)
+                    first_pt = q.ul
+                    last_pt  = q.ul
+                    cx = (q.ul.x + q.lr.x)/2
+                    cy = (q.ul.y + q.lr.y)/2
+                    ax.text(cx, cy, str(global_op_id), fontsize=6, color="red",
+                            ha="center", va="center",
+                            bbox=dict(boxstyle="round,pad=0.15", fc="yellow", alpha=0.7))
+
+                else:
+                    msg = f"    *** UNHANDLED OPERATOR: {op} ***"
+                    print(msg)
+                    log.write(msg + "\n")
+
+            # ---- implicit closePath ----
+            if close and first_pt is not None and last_pt is not None:
+                if abs(first_pt.x - last_pt.x) > 1e-3 or abs(first_pt.y - last_pt.y) > 1e-3:
+                    segments.append([(last_pt.x, last_pt.y), (first_pt.x, first_pt.y)])
+                    log.write(f"  (implicit closePath line added)\n")
+
+            if segments:
+                lc = LineCollection(segments, colors=[color], linewidths=max(lw, 0.4), alpha=0.9)
+                ax.add_collection(lc)
+
+            log.write("\n")
+            print()
+
+        vector_path = out_dir / f"page{page_num:02d}_vectors_numbered.png"
+        plt.tight_layout()
+        plt.savefig(vector_path, dpi=160, bbox_inches="tight")
+        plt.close()
+        print(f"Saved numbered vector plot → {vector_path}")
+        print(f"Full operator dump         → {log_path}")
+
 def inspect_page(page: fitz.Page, page_num: int, out_dir: Path):
     print_header(f"PAGE {page_num}  ({page.rect.width:.1f} × {page.rect.height:.1f} pts)")
 
@@ -139,53 +273,7 @@ def inspect_page(page: fitz.Page, page_num: int, out_dir: Path):
 
     # B) Pure vector plot with matplotlib
     if drawings:
-        fig, ax = plt.subplots(1, 1, figsize=(12, 12 * page.rect.height / page.rect.width))
-        ax.set_xlim(page.rect.x0, page.rect.x1)
-        ax.set_ylim(page.rect.y1, page.rect.y0)  # PDF y grows upward, matplotlib downward
-        ax.set_aspect("equal")
-        ax.set_title(f"Vector paths only – page {page_num} ({len(drawings)} paths)")
-        ax.axis("off")
-
-        for path in drawings:
-            color = path.get("color") or (0, 0, 0)
-            fill = path.get("fill")
-            lw = path.get("width") or 0.5
-
-            # Collect line segments for this path
-            segments = []
-            for item in path.get("items", []):
-                op = item[0]
-                if op == "l":                      # line
-                    p1, p2 = item[1], item[2]
-                    segments.append([(p1.x, p1.y), (p2.x, p2.y)])
-                elif op == "re":                   # rectangle
-                    r = item[1]
-                    segments.append([(r.x0, r.y0), (r.x1, r.y0)])
-                    segments.append([(r.x1, r.y0), (r.x1, r.y1)])
-                    segments.append([(r.x1, r.y1), (r.x0, r.y1)])
-                    segments.append([(r.x0, r.y1), (r.x0, r.y0)])
-                elif op == "c":                    # cubic Bézier – approximate with polyline
-                    p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
-                    # simple sampling
-                    ts = np.linspace(0, 1, 12)
-                    pts = []
-                    for t in ts:
-                        x = (1-t)**3*p0.x + 3*(1-t)**2*t*p1.x + 3*(1-t)*t**2*p2.x + t**3*p3.x
-                        y = (1-t)**3*p0.y + 3*(1-t)**2*t*p1.y + 3*(1-t)*t**2*p2.y + t**3*p3.y
-                        pts.append((x, y))
-                    for a, b in zip(pts[:-1], pts[1:]):
-                        segments.append([a, b])
-                # (other operators qu/v/y can be added similarly if needed)
-
-            if segments:
-                lc = LineCollection(segments, colors=[color], linewidths=lw, alpha=0.85)
-                ax.add_collection(lc)
-
-        vector_path = out_dir / f"page{page_num:02d}_vectors.png"
-        plt.tight_layout()
-        plt.savefig(vector_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        print(f"Saved vector plot   → {vector_path}")
+        dump_and_plot_drawings(page, drawings, page_num, out_dir)
 
     return len(drawings)
 
