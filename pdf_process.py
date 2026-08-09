@@ -3,8 +3,7 @@ import re
 import sys
 import pikepdf
 
-SCRIPT_DIR = Path(__file__).resolve().parent   # = patterns/
-
+PATTERNS_DIR = Path(__file__).resolve().parent / "patterns"
 
 def _sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(name))
@@ -24,7 +23,7 @@ def _get_layer_name(page, ocg_key) -> str:
 
 
 def extract_layers_from_pdf(pdf_path: Path, out_dir: Path | None = None):
-    """Extract every OCG layer from one PDF into its own files."""
+    """Extract every OCG layer into its own multi-page PDF."""
     if out_dir is None:
         out_dir = pdf_path.parent / "extracted_layers"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -35,37 +34,46 @@ def extract_layers_from_pdf(pdf_path: Path, out_dir: Path | None = None):
 
     with pikepdf.open(pdf_path) as pdf:
         try:
-            ocgs = pdf.Root.OCProperties.OCGs
+            ocgs = list(pdf.Root.OCProperties.OCGs)
             print(f"Document contains {len(ocgs)} OCG(s)")
         except (AttributeError, KeyError):
             print("  → No layers found, skipping.")
             return 0
-        page_count = len(pdf.pages)
 
-    hidden_operators = {
-        "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "n",
-        "Do", "sh", "Tj", "TJ", "m", "l", "c", "v", "y", "h", "re"
-    }
+        # Collect all unique layer keys that actually appear in the document
+        # (we will process them one by one)
+        all_ocg_keys = set()
+        for page in pdf.pages:
+            try:
+                props = page.Resources.Properties
+                for key in props.keys():
+                    # only keep keys that point to an OCG
+                    obj = props[key]
+                    if hasattr(obj, "get_object"):
+                        obj = obj.get_object()
+                    if obj.get("/Type") == "/OCG":
+                        all_ocg_keys.add(key)
+            except Exception:
+                pass
+
+        if not all_ocg_keys:
+            print("  → No usable layer keys found on any page.")
+            return 0
+
+        print(f"Found {len(all_ocg_keys)} unique layer key(s) used in content")
 
     total_saved = 0
 
-    for page_idx in range(page_count):
-        print(f"\n  ----- Page {page_idx} -----")
-        extracted_groups = []
-        end_reached = False
-        layer_pass = 0
+    # Process one layer at a time
+    for ocg_key in sorted(all_ocg_keys, key=str):
+        print(f"\n  ===== Extracting layer: {ocg_key} =====")
 
-        while not end_reached:
-            commands = []
-            extract_commands = True
-            extracted_one = False
-            current_ocg_key = None
-
-            with pikepdf.open(pdf_path) as pdf:
-                page = pdf.pages[page_idx]
-                for j in range(len(pdf.pages) - 1, -1, -1):
-                    if j != page_idx:
-                        del pdf.pages[j]
+        with pikepdf.open(pdf_path) as pdf:
+            # We keep every page, but strip content that does not belong to this layer
+            for page_idx, page in enumerate(pdf.pages):
+                commands = []
+                extract_commands = True          # start outside any OC group
+                inside_target_layer = False
 
                 for operands, operator in pikepdf.parse_content_stream(page):
                     op_str = str(operator)
@@ -77,48 +85,63 @@ def extract_layers_from_pdf(pdf_path: Path, out_dir: Path | None = None):
                     )
 
                     if is_oc_start:
-                        ocg_key = operands[1]
-                        if ocg_key not in extracted_groups and not extracted_one:
-                            extracted_groups.append(ocg_key)
+                        current_key = operands[1]
+                        if current_key == ocg_key:
                             extract_commands = True
-                            extracted_one = True
-                            current_ocg_key = ocg_key
-                            print(f"    Pass {layer_pass}: extracting {ocg_key}")
+                            inside_target_layer = True
                         else:
                             extract_commands = False
-
-                    if op_str == "EMC":
-                        extract_commands = True
+                            inside_target_layer = False
+                        # Always keep the BDC itself so the structure stays valid
+                        commands.append([operands, operator])
                         continue
 
-                    if extract_commands or (
-                        not extract_commands and op_str not in hidden_operators
-                    ):
+                    if op_str == "EMC":
+                        # Always keep the EMC
+                        commands.append([operands, operator])
+                        extract_commands = True
+                        inside_target_layer = False
+                        continue
+
+                    # Keep the operator only if we are currently inside the target layer
+                    # or if we are outside any OC group (optional – see note below)
+                    if extract_commands:
                         commands.append([operands, operator])
 
-                if not extracted_one:
-                    end_reached = True
-                    print(f"    No more new layers on page {page_idx}")
-                else:
-                    page.Contents = pdf.make_stream(
-                        pikepdf.unparse_content_stream(commands)
-                    )
+                # Write the filtered content stream back to the page
+                page.Contents = pdf.make_stream(
+                    pikepdf.unparse_content_stream(commands)
+                )
 
-                    layer_name = _get_layer_name(page, current_ocg_key)
-                    safe = _sanitize_filename(layer_name)
+            # Determine a nice filename
+            # Try to get the human-readable name from the first page that has it
+            layer_name = str(ocg_key)
+            try:
+                for page in pdf.pages:
+                    try:
+                        props = page.Resources.Properties
+                        if ocg_key in props:
+                            layer_name = _get_layer_name(page, ocg_key)
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
-                    out_path = out_dir / f"{safe}.pdf"
-                    counter = 1
-                    while out_path.exists():
-                        out_path = out_dir / f"{safe}_{counter}.pdf"
-                        counter += 1
+            safe = _sanitize_filename(layer_name)
+            out_path = out_dir / f"{safe}.pdf"
 
-                    pdf.save(out_path)
-                    print(f"    → Saved '{layer_name}' as {out_path.name}")
-                    layer_pass += 1
-                    total_saved += 1
+            # Avoid overwriting if the same layer name appears in multiple source PDFs
+            counter = 1
+            while out_path.exists():
+                out_path = out_dir / f"{safe}_{counter}.pdf"
+                counter += 1
 
-    print(f"\nFinished {pdf_path.name} – saved {total_saved} layer file(s)")
+            pdf.save(out_path)
+            print(f"  → Saved multi-page layer as {out_path.name}")
+            total_saved += 1
+
+    print(f"\nFinished {pdf_path.name} – saved {total_saved} multi-page layer file(s)")
     return total_saved
 
 
@@ -126,10 +149,10 @@ def process_all_patterns():
     """
     Walk every sub-folder of the patterns directory and process every PDF inside.
     """
-    print(f"Looking for pattern folders under: {SCRIPT_DIR}")
+    print(f"Looking for pattern folders under: {PATTERNS_DIR}")
 
     # Only immediate sub-directories (the individual pattern folders)
-    pattern_folders = [d for d in SCRIPT_DIR.iterdir() if d.is_dir()]
+    pattern_folders = [d for d in PATTERNS_DIR.iterdir() if d.is_dir()]
 
     if not pattern_folders:
         print("No pattern folders found.")
@@ -158,5 +181,5 @@ if __name__ == "__main__":
 
     # 2. Or process only one specific PDF (uncomment if you prefer)
     # extract_layers_from_pdf(
-    #     SCRIPT_DIR / "ultimate_costume_creator_a0_format" / "ultimate_costume_creator_a0_format.pdf"
+    #     PATTERNS_DIR / "ultimate_costume_creator_a0_format" / "ultimate_costume_creator_a0_format.pdf"
     # )
