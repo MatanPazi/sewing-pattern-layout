@@ -296,3 +296,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# TODO/issues:
+# 
+# 1. Detecting tilted lines doesn't work well. I suspect that the encompassing rectangle isn't tilted, so the resulting width/height of a tilted line leads to a large thickness.
+# 2. I think bezier curves should be ignored when looking for lines, I'd assume fold/grain lines would never be drawn with a curve, but rather with straight lines.
+# 3. None of the fold lines were detected... As well as short grain lines... (Good example is '.\patterns\Copy_Shop_Corrine\extracted_layers\Do not hide!.pdf')
+# 
