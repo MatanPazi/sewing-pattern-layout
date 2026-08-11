@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Detect sewing pattern pieces (segment clustering) or
-grain / fold lines (long shaft + nearby arrowheads).
+Detect sewing pattern pieces and special lines (grain / fold).
+
+Outputs:
+  - PNG visualisation
+  - *_patterns.txt
+  - *_lines.txt
 
 Usage:
     python outline_patterns.py input.pdf --mode patterns --page 0
     python outline_patterns.py input.pdf --mode lines    --page 0
+    python outline_patterns.py input.pdf --mode both     --page 0
 """
 
 import argparse
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 import fitz
 import numpy as np
 import matplotlib.pyplot as plt
@@ -19,7 +24,7 @@ from matplotlib.patches import Rectangle
 
 
 # ------------------------------------------------------------------
-# Convert a path into a list of short line segments
+# Geometry helpers
 # ------------------------------------------------------------------
 def path_to_segments(path):
     segments = []
@@ -72,8 +77,22 @@ def bbox_distance(b1, b2):
     return (dx*dx + dy*dy) ** 0.5
 
 
+def segments_are_close(seg1, seg2, threshold):
+    b1 = (min(seg1[0][0], seg1[1][0]), min(seg1[0][1], seg1[1][1]),
+          max(seg1[0][0], seg1[1][0]), max(seg1[0][1], seg1[1][1]))
+    b2 = (min(seg2[0][0], seg2[1][0]), min(seg2[0][1], seg2[1][1]),
+          max(seg2[0][0], seg2[1][0]), max(seg2[0][1], seg2[1][1]))
+    if bbox_distance(b1, b2) > threshold:
+        return False
+    for p in seg1:
+        for q in seg2:
+            if point_distance(p, q) <= threshold:
+                return True
+    return False
+
+
 # ------------------------------------------------------------------
-# Union-Find (used only by pattern mode)
+# Union-Find
 # ------------------------------------------------------------------
 class UnionFind:
     def __init__(self, n):
@@ -98,22 +117,8 @@ class UnionFind:
             self.rank[ra] += 1
 
 
-def segments_are_close(seg1, seg2, threshold):
-    b1 = (min(seg1[0][0], seg1[1][0]), min(seg1[0][1], seg1[1][1]),
-          max(seg1[0][0], seg1[1][0]), max(seg1[0][1], seg1[1][1]))
-    b2 = (min(seg2[0][0], seg2[1][0]), min(seg2[0][1], seg2[1][1]),
-          max(seg2[0][0], seg2[1][0]), max(seg2[0][1], seg2[1][1]))
-    if bbox_distance(b1, b2) > threshold:
-        return False
-    for p in seg1:
-        for q in seg2:
-            if point_distance(p, q) <= threshold:
-                return True
-    return False
-
-
 # ------------------------------------------------------------------
-# PATTERN mode (unchanged – segment clustering)
+# PATTERN detection
 # ------------------------------------------------------------------
 def detect_patterns(page, dist_threshold=5.0, min_area=600.0):
     drawings = page.get_drawings()
@@ -164,29 +169,21 @@ def detect_patterns(page, dist_threshold=5.0, min_area=600.0):
 
 
 # ------------------------------------------------------------------
-# LINES mode – long shaft + nearby arrowheads
+# SPECIAL LINES detection (grain / fold)
 # ------------------------------------------------------------------
 def detect_special_lines(page,
-                         min_shaft_length=30.0,
-                         arrow_search_radius=5.0,   # can be smaller now
+                         min_shaft_length=35.0,
+                         arrow_search_radius=8.0,
                          max_arrow_size=35.0,
-                         max_arrow_segments=6,
+                         max_arrow_segments=8,
                          min_arrow_width=0.7,
-                         point_tol=1.0):             # tolerance for matching points
-    """
-    Detect grain / fold lines.
-    Uses true geometric terminals (degree-1 points) of the shaft
-    instead of the two farthest points.
-    """
-    from collections import Counter, defaultdict
-
+                         point_tol=1.0):
     drawings = page.get_drawings()
 
     shafts = []
     arrow_candidates = []
 
     def quantize(p):
-        """Snap point to a grid so nearly-identical points match."""
         return (round(p[0] / point_tol), round(p[1] / point_tol))
 
     for path in drawings:
@@ -202,14 +199,11 @@ def detect_special_lines(page,
         width = path.get("width") or 0.0
         num_segments = len(segs)
 
-        # ---------- potential shaft ----------
+        # ----- potential shaft -----
         is_stroked = path.get("color") is not None or width > 0
         if is_stroked and length >= min_shaft_length:
-
-            # Count occurrences of every point
             counts = Counter()
-            examples = {}          # quantized → actual coordinate
-
+            examples = {}
             for a, b in segs:
                 qa, qb = quantize(a), quantize(b)
                 counts[qa] += 1
@@ -217,10 +211,8 @@ def detect_special_lines(page,
                 examples[qa] = a
                 examples[qb] = b
 
-            # True terminals = points that appear only once
             terminals = [examples[q] for q, c in counts.items() if c == 1]
 
-            # Fallback if we somehow got fewer than 2 terminals
             if len(terminals) < 2:
                 pts = [p for s in segs for p in s]
                 max_d = -1.0
@@ -233,7 +225,6 @@ def detect_special_lines(page,
                             ep1, ep2 = pts[i], pts[j]
                 terminals = [ep1, ep2]
 
-            # If more than 2 terminals exist, keep the two farthest apart
             if len(terminals) > 2:
                 max_d = -1.0
                 best = (terminals[0], terminals[1])
@@ -251,9 +242,10 @@ def detect_special_lines(page,
                 "length": length,
                 "endpoints": tuple(terminals[:2]),
                 "rect": r,
+                "num_segments": num_segments,
             })
 
-        # ---------- potential arrowhead ----------
+        # ----- potential arrowhead -----
         size = max(r.width, r.height)
         if size > max_arrow_size:
             continue
@@ -266,16 +258,14 @@ def detect_special_lines(page,
             "path": path,
             "segments": segs,
             "rect": r,
-            "filled": path.get("fill") is not None,
             "center": ((r.x0 + r.x1)/2, (r.y0 + r.y1)/2),
         })
 
-    # ---------- match shafts with nearby arrowheads ----------
+    # ----- match shafts with arrowheads -----
     results = []
     for shaft in shafts:
         ep1, ep2 = shaft["endpoints"]
         nearby = []
-
         for arrow in arrow_candidates:
             d1 = point_distance(arrow["center"], ep1)
             d2 = point_distance(arrow["center"], ep2)
@@ -285,12 +275,14 @@ def detect_special_lines(page,
         if not nearby:
             continue
 
-        score = len(nearby)
+        # Simple classification
+        line_type = "grain" if shaft["num_segments"] == 1 else "fold"
 
         results.append({
+            "type": line_type,
             "shaft": shaft,
             "arrows": nearby,
-            "score": score,
+            "score": len(nearby),
             "segments": shaft["segments"],
             "all_segments": shaft["segments"] +
                             [s for a in nearby for s in a["segments"]],
@@ -298,6 +290,45 @@ def detect_special_lines(page,
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
+
+
+# ------------------------------------------------------------------
+# Write text output
+# ------------------------------------------------------------------
+def write_patterns_txt(pieces, out_path: Path):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"# Pattern pieces: {len(pieces)}\n\n")
+        for i, p in enumerate(pieces):
+            f.write(f"PIECE {i}\n")
+            f.write(f"  area     : {p['area']:.1f}\n")
+            f.write(f"  bbox     : {p['bbox']}\n")
+            f.write(f"  path_ids : {p['path_ids']}\n")
+            f.write(f"  segments : {len(p['segments'])}\n")
+            for s in p["segments"]:
+                f.write(f"    {s[0]} -> {s[1]}\n")
+            f.write("\n")
+    print(f"Wrote patterns → {out_path}")
+
+
+def write_lines_txt(lines, out_path: Path):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"# Special lines: {len(lines)}\n\n")
+        for i, obj in enumerate(lines):
+            f.write(f"LINE {i}  type={obj['type']}\n")
+            f.write(f"  score        : {obj['score']}\n")
+            f.write(f"  shaft_length : {obj['shaft']['length']:.1f}\n")
+            f.write(f"  shaft_segs   : {obj['shaft']['num_segments']}\n")
+            f.write(f"  endpoints    : {obj['shaft']['endpoints']}\n")
+            f.write(f"  arrows       : {len(obj['arrows'])}\n")
+            f.write("  shaft segments:\n")
+            for s in obj["shaft"]["segments"]:
+                f.write(f"    {s[0]} -> {s[1]}\n")
+            f.write("  arrow segments:\n")
+            for a in obj["arrows"]:
+                for s in a["segments"]:
+                    f.write(f"    {s[0]} -> {s[1]}\n")
+            f.write("\n")
+    print(f"Wrote lines → {out_path}")
 
 
 # ------------------------------------------------------------------
@@ -312,7 +343,6 @@ def render(page, objects, mode, out_path: Path):
     ax.axis("off")
     ax.set_title(f"{mode.upper()} detection")
 
-    # Background
     pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
     ax.imshow(img, extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
@@ -323,35 +353,31 @@ def render(page, objects, mode, out_path: Path):
     if mode == "patterns":
         for i, piece in enumerate(objects):
             color = colors[i % len(colors)]
-            lc = LineCollection(piece["segments"], colors=[color],
-                                linewidths=1.8, alpha=0.9)
+            lc = LineCollection(piece["segments"], colors=[color], linewidths=1.8, alpha=0.9)
             ax.add_collection(lc)
             x0, y0, x1, y1 = piece["bbox"]
-            rect = Rectangle((x0, y0), x1-x0, y1-y0,
-                             fill=False, edgecolor=color,
+            rect = Rectangle((x0, y0), x1-x0, y1-y0, fill=False, edgecolor=color,
                              linestyle="--", linewidth=1.0, alpha=0.7)
             ax.add_patch(rect)
             ax.text(x0+4, y1-4, str(i), color=color, fontsize=11, fontweight="bold",
                     bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1))
     else:
-        # lines mode
         for i, obj in enumerate(objects):
-            # draw shaft + arrowheads in red
-            lc = LineCollection(obj["all_segments"], colors="red",
-                                linewidths=2.2, alpha=0.9)
+            color = "red" if obj["type"] == "grain" else "purple"
+            lc = LineCollection(obj["all_segments"], colors=color, linewidths=2.2, alpha=0.9)
             ax.add_collection(lc)
-            # also mark the shaft endpoints
             for ep in obj["shaft"]["endpoints"]:
                 ax.plot(ep[0], ep[1], "o", color="orange", markersize=6)
             ax.text(obj["shaft"]["endpoints"][0][0],
                     obj["shaft"]["endpoints"][0][1],
-                    str(i), color="red", fontsize=10, fontweight="bold",
+                    f"{i}:{obj['type'][0].upper()}", color=color,
+                    fontsize=9, fontweight="bold",
                     bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"Saved → {out_path}")
+    print(f"Saved PNG → {out_path}")
 
 
 # ------------------------------------------------------------------
@@ -360,52 +386,56 @@ def render(page, objects, mode, out_path: Path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("pdf", type=Path)
-    parser.add_argument("--mode", choices=["patterns", "lines"], required=True)
+    parser.add_argument("--mode", choices=["patterns", "lines", "both"], default="both")
     parser.add_argument("--page", type=int, default=0)
-    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--out-dir", type=Path, default=None)
 
-    # pattern parameters
+    # pattern params
     parser.add_argument("--dist", type=float, default=5.0)
     parser.add_argument("--min-area", type=float, default=600.0)
 
-    # line parameters
-    parser.add_argument("--min-shaft", type=float, default=30.0,
-                        help="Minimum length of the main shaft")
-    parser.add_argument("--arrow-radius", type=float, default=5.0,
-                        help="How close an arrowhead must be to a shaft end")
-    parser.add_argument("--max-arrow-size", type=float, default=35.0,
-                        help="Maximum size of a shape to be considered an arrowhead")
+    # line params
+    parser.add_argument("--min-shaft", type=float, default=35.0)
+    parser.add_argument("--arrow-radius", type=float, default=8.0)
+    parser.add_argument("--max-arrow-size", type=float, default=35.0)
+    parser.add_argument("--point-tol", type=float, default=1.0)
 
     args = parser.parse_args()
 
     doc = fitz.open(args.pdf)
     page = doc[args.page]
 
-    if args.mode == "patterns":
-        objects = detect_patterns(page, dist_threshold=args.dist, min_area=args.min_area)
-        print(f"Found {len(objects)} pattern candidate(s)")
-        for i, p in enumerate(objects):
-            print(f"  [{i}] area={p['area']:.0f}  paths={p['path_ids']}")
-    else:
-        objects = detect_special_lines(
+    out_dir = args.out_dir or args.pdf.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{args.pdf.stem}_p{args.page:02d}"
+
+    if args.mode in ("patterns", "both"):
+        pieces = detect_patterns(page, dist_threshold=args.dist, min_area=args.min_area)
+        print(f"Found {len(pieces)} pattern piece(s)")
+        write_patterns_txt(pieces, out_dir / f"{stem}_patterns.txt")
+        render(page, pieces, "patterns", out_dir / f"{stem}_patterns.png")
+
+    if args.mode in ("lines", "both"):
+        lines = detect_special_lines(
             page,
             min_shaft_length=args.min_shaft,
             arrow_search_radius=args.arrow_radius,
             max_arrow_size=args.max_arrow_size,
+            point_tol=args.point_tol,
         )
-        print(f"Found {len(objects)} special-line candidate(s)")
-        for i, obj in enumerate(objects):
-            print(f"  [{i}] score={obj['score']}  "
-                  f"shaft_len={obj['shaft']['length']:.1f}  "
-                  f"arrows={len(obj['arrows'])} "
-                  f"(filled={sum(1 for a in obj['arrows'] if a['filled'])})")
+        print(f"Found {len(lines)} special line(s)")
+        for i, obj in enumerate(lines):
+            print(f"  [{i}] {obj['type']:5s}  score={obj['score']}  "
+                  f"shaft_len={obj['shaft']['length']:.1f}  segs={obj['shaft']['num_segments']}")
+        write_lines_txt(lines, out_dir / f"{stem}_lines.txt")
+        render(page, lines, "lines", out_dir / f"{stem}_lines.png")
 
-    out_path = args.out or args.pdf.with_name(
-        f"{args.pdf.stem}_p{args.page:02d}_{args.mode}.png"
-    )
-    render(page, objects, args.mode, out_path)
     doc.close()
 
 
 if __name__ == "__main__":
     main()
+
+
+# TODO:
+# Improve detect_patterns runtime
