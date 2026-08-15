@@ -175,7 +175,7 @@ def detect_special_lines(page,
                          min_shaft_length=35.0,
                          arrow_search_radius=8.0,
                          max_arrow_size=35.0,
-                         max_arrow_segments=8,
+                         max_arrow_segments=30,
                          min_arrow_width=0.7,
                          point_tol=1.0):
     drawings = page.get_drawings()
