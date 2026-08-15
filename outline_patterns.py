@@ -178,6 +178,11 @@ def detect_special_lines(page,
                          max_arrow_segments=30,
                          min_arrow_width=0.7,
                          point_tol=1.0):
+    """
+    Detect grain / fold lines.
+    """
+    from collections import Counter
+
     drawings = page.get_drawings()
 
     shafts = []
@@ -185,6 +190,56 @@ def detect_special_lines(page,
 
     def quantize(p):
         return (round(p[0] / point_tol), round(p[1] / point_tol))
+
+    def geometric_terminals(segs):
+        counts = Counter()
+        examples = {}
+        for a, b in segs:
+            qa, qb = quantize(a), quantize(b)
+            counts[qa] += 1
+            counts[qb] += 1
+            examples[qa] = a
+            examples[qb] = b
+
+        terminals = [examples[q] for q, c in counts.items() if c == 1]
+
+        if len(terminals) < 2:
+            pts = [p for s in segs for p in s]
+            max_d = -1.0
+            ep1 = ep2 = pts[0]
+            for i in range(len(pts)):
+                for j in range(i + 1, len(pts)):
+                    d = point_distance(pts[i], pts[j])
+                    if d > max_d:
+                        max_d = d
+                        ep1, ep2 = pts[i], pts[j]
+            terminals = [ep1, ep2]
+
+        if len(terminals) > 2:
+            max_d = -1.0
+            best = (terminals[0], terminals[1])
+            for i in range(len(terminals)):
+                for j in range(i + 1, len(terminals)):
+                    d = point_distance(terminals[i], terminals[j])
+                    if d > max_d:
+                        max_d = d
+                        best = (terminals[i], terminals[j])
+            terminals = list(best)
+
+        return tuple(terminals[:2])
+
+    def has_long_straight_segment(path, min_len):
+        """
+        True if the original path contains at least one straight 'l' segment
+        long enough to be a real shaft edge.
+        """
+        for item in path.get("items", []):
+            if item[0] != "l":
+                continue
+            p1, p2 = item[1], item[2]
+            if point_distance((p1.x, p1.y), (p2.x, p2.y)) >= min_len:
+                return True
+        return False
 
     for path in drawings:
         segs = path_to_segments(path)
@@ -199,53 +254,24 @@ def detect_special_lines(page,
         width = path.get("width") or 0.0
         num_segments = len(segs)
 
-        # ----- potential shaft -----
+        # ---------- potential shaft ----------
         is_stroked = path.get("color") is not None or width > 0
         if is_stroked and length >= min_shaft_length:
-            counts = Counter()
-            examples = {}
-            for a, b in segs:
-                qa, qb = quantize(a), quantize(b)
-                counts[qa] += 1
-                counts[qb] += 1
-                examples[qa] = a
-                examples[qb] = b
+            # Has at least one long straight "l"
+            if not has_long_straight_segment(path, min_shaft_length):
+                pass  # reject as shaft
+            else:
+                endpoints = geometric_terminals(segs)
+                shafts.append({
+                    "path": path,
+                    "segments": segs,
+                    "length": length,
+                    "endpoints": endpoints,
+                    "rect": r,
+                    "num_segments": num_segments,
+                })
 
-            terminals = [examples[q] for q, c in counts.items() if c == 1]
-
-            if len(terminals) < 2:
-                pts = [p for s in segs for p in s]
-                max_d = -1.0
-                ep1 = ep2 = pts[0]
-                for i in range(len(pts)):
-                    for j in range(i+1, len(pts)):
-                        d = point_distance(pts[i], pts[j])
-                        if d > max_d:
-                            max_d = d
-                            ep1, ep2 = pts[i], pts[j]
-                terminals = [ep1, ep2]
-
-            if len(terminals) > 2:
-                max_d = -1.0
-                best = (terminals[0], terminals[1])
-                for i in range(len(terminals)):
-                    for j in range(i+1, len(terminals)):
-                        d = point_distance(terminals[i], terminals[j])
-                        if d > max_d:
-                            max_d = d
-                            best = (terminals[i], terminals[j])
-                terminals = list(best)
-
-            shafts.append({
-                "path": path,
-                "segments": segs,
-                "length": length,
-                "endpoints": tuple(terminals[:2]),
-                "rect": r,
-                "num_segments": num_segments,
-            })
-
-        # ----- potential arrowhead -----
+        # ---------- potential external arrowhead ----------
         size = max(r.width, r.height)
         if size > max_arrow_size:
             continue
@@ -258,31 +284,34 @@ def detect_special_lines(page,
             "path": path,
             "segments": segs,
             "rect": r,
-            "center": ((r.x0 + r.x1)/2, (r.y0 + r.y1)/2),
+            "center": ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2),
         })
 
-    # ----- match shafts with arrowheads -----
     results = []
     for shaft in shafts:
         ep1, ep2 = shaft["endpoints"]
         nearby = []
+
         for arrow in arrow_candidates:
+            if arrow["path"] is shaft["path"]:
+                continue
             d1 = point_distance(arrow["center"], ep1)
             d2 = point_distance(arrow["center"], ep2)
             if min(d1, d2) <= arrow_search_radius:
                 nearby.append(arrow)
 
+        # still allow a single arrowhead
         if not nearby:
             continue
 
-        # Simple classification
         line_type = "grain" if shaft["num_segments"] == 1 else "fold"
+        score = len(nearby)
 
         results.append({
             "type": line_type,
             "shaft": shaft,
             "arrows": nearby,
-            "score": len(nearby),
+            "score": score,
             "segments": shaft["segments"],
             "all_segments": shaft["segments"] +
                             [s for a in nearby for s in a["segments"]],
