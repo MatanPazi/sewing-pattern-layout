@@ -129,10 +129,14 @@ def detect_patterns(page,
                     max_dart_length=220.0,
                     attach_tol=12.0):
     """
-    Goal 2:
-      - main near-closed outline (path_ids = contour only)
-      - darts = short same-style internal chains
-      - size options = one joined chain per alternate colour/style
+    Goal 2 pattern detection via generic geometric graph cycles.
+
+    - Each stroked path is an edge between two terminals
+    - Same-style terminals snap within gap_threshold
+    - Closed outlines = cycles of any number of paths
+    - Near-cycles allowed when chain ends are within gap
+    - Darts = short same-style leftovers
+    - Length options = one joined chain per alternate style attached to a main cycle
     """
     from collections import defaultdict, Counter
     import math
@@ -150,16 +154,14 @@ def detect_patterns(page,
             return None
         return tuple(round(float(x), 3) for x in c[:3])
 
-    def style_key(path_rec):
-        return (path_rec["color"], path_rec["width"])
-
     def poly_area(pts):
         if len(pts) < 3:
             return 0.0
         a = 0.0
-        for i in range(len(pts)):
+        n = len(pts)
+        for i in range(n):
             x1, y1 = pts[i]
-            x2, y2 = pts[(i + 1) % len(pts)]
+            x2, y2 = pts[(i + 1) % n]
             a += x1 * y2 - x2 * y1
         return abs(a) * 0.5
 
@@ -170,46 +172,44 @@ def detect_patterns(page,
             return (0.0, 0.0, 0.0, 0.0)
         return (min(xs), min(ys), max(xs), max(ys))
 
-    def path_geometry(path):
-        segs = path_to_segments(path)
-        if not segs:
-            return None
-        length = 0.0
-        counts = Counter()
-        sample = {}
-        for a, b in segs:
-            length += dist(a, b)
-            qa, qb = quant(a), quant(b)
-            counts[qa] += 1
-            counts[qb] += 1
-            sample[qa] = a
-            sample[qb] = b
-        terms = [sample[q] for q, n in counts.items() if n == 1]
-        if len(terms) < 2:
-            pts = [p for s in segs for p in s]
-            best_d = -1.0
-            best = (pts[0], pts[-1])
-            for i in range(len(pts)):
-                for j in range(i + 1, len(pts)):
-                    d = dist(pts[i], pts[j])
-                    if d > best_d:
-                        best_d = d
-                        best = (pts[i], pts[j])
-            terms = list(best)
-        elif len(terms) > 2:
-            best_d = -1.0
-            best = (terms[0], terms[1])
-            for i in range(len(terms)):
-                for j in range(i + 1, len(terms)):
-                    d = dist(terms[i], terms[j])
-                    if d > best_d:
-                        best_d = d
-                        best = (terms[i], terms[j])
-            terms = list(best)
-        return segs, (terms[0], terms[1]), length
+    def path_chain_terminals(path):
+        """Stable terminals: first operator start, last operator end."""
+        items = path.get("items", [])
+        if not items:
+            return None, None
+        t_start = t_end = None
+        it0, itn = items[0], items[-1]
+        op0, opn = it0[0], itn[0]
+        try:
+            if op0 == "l":
+                t_start = (it0[1].x, it0[1].y)
+            elif op0 == "c":
+                t_start = (it0[1].x, it0[1].y)
+            elif op0 == "re":
+                r = it0[1]
+                t_start = (r.x0, r.y0)
+            elif op0 == "qu":
+                q = it0[1]
+                t_start = (q.ul.x, q.ul.y)
+        except Exception:
+            pass
+        try:
+            if opn == "l":
+                t_end = (itn[2].x, itn[2].y)
+            elif opn == "c":
+                t_end = (itn[4].x, itn[4].y)
+            elif opn == "re":
+                r = itn[1]
+                t_end = (r.x0, r.y0)
+            elif opn == "qu":
+                q = itn[1]
+                t_end = (q.ul.x, q.ul.y)
+        except Exception:
+            pass
+        return t_start, t_end
 
     # ------------------------------------------------------------------
-    # 1) Collect stroked paths
+    # 1) Collect stroked paths as candidate edges
     # ------------------------------------------------------------------
     paths = []
     for idx, path in enumerate(drawings):
@@ -217,384 +217,399 @@ def detect_patterns(page,
         width = float(path.get("width") or 0.0)
         if color is None and width <= 0:
             continue
-        geom = path_geometry(path)
-        if geom is None:
+
+        segs = path_to_segments(path)
+        if not segs:
             continue
-        segs, terminals, length = geom
+        length = sum(dist(a, b) for a, b in segs)
         if length < 1.0:
             continue
+
+        t0, t1 = path_chain_terminals(path)
+        if t0 is None or t1 is None:
+            t0, t1 = segs[0][0], segs[-1][1]
+
         paths.append({
             "id": idx,
             "color": color_key(color),
             "width": round(width, 2),
             "segments": segs,
-            "terminals": terminals,
+            "t0": t0,
+            "t1": t1,
             "length": length,
         })
 
-    print(f"Pattern paths used: {len(paths)}")
+    n_paths = len(paths)
+    print(f"Pattern paths used: {n_paths}")
     if not paths:
         return []
 
     # ------------------------------------------------------------------
-    # 2) Snap terminals and connect only same-style paths
+    # 2) Same-style terminal snapping → graph nodes
     # ------------------------------------------------------------------
-    term_nodes = []  # (local_path_idx, term_i, xy)
-    for i, pre in enumerate(paths):
-        for ti, xy in enumerate(pre["terminals"]):
-            term_nodes.append((i, ti, xy))
+    # terminal records: (path_local, end_idx 0/1, xy, style)
+    terms = []
+    for i, p in enumerate(paths):
+        style = (p["color"], p["width"])
+        terms.append((i, 0, p["t0"], style))
+        terms.append((i, 1, p["t1"], style))
 
-    parent = list(range(len(term_nodes)))
+    parent = list(range(len(terms)))
 
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[rj] = ri
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
 
     cell = max(gap_threshold * 1.5, 4.0)
     grid = defaultdict(list)
-    for i, (_, _, xy) in enumerate(term_nodes):
-        grid[(int(xy[0] // cell), int(xy[1] // cell))].append(i)
+    for ti, (pi, ei, xy, style) in enumerate(terms):
+        grid[(style, int(xy[0] // cell), int(xy[1] // cell))].append(ti)
 
     neigh = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
-    for i, (pi, _, xy) in enumerate(term_nodes):
+    for ti, (pi, ei, xy, style) in enumerate(terms):
         cx, cy = int(xy[0] // cell), int(xy[1] // cell)
         for dx, dy in neigh:
-            for j in grid.get((cx + dx, cy + dy), []):
-                if j <= i:
+            for tj in grid.get((style, cx + dx, cy + dy), []):
+                if tj <= ti:
                     continue
-                pj = term_nodes[j][0]
-                # only snap endpoints of same style
-                if style_key(paths[pi]) != style_key(paths[pj]):
-                    continue
-                if dist(xy, term_nodes[j][2]) <= gap_threshold:
-                    union(i, j)
+                if dist(xy, terms[tj][2]) <= gap_threshold:
+                    union(ti, tj)
 
-    snap = {}
-    for i, (pi, ti, _) in enumerate(term_nodes):
-        snap[(pi, ti)] = find(i)
+    def node_id(path_local, end_idx):
+        return find(path_local * 2 + end_idx)
 
-    # adjacency among same-style paths
-    node_members = defaultdict(list)
-    for i, (pi, ti, _) in enumerate(term_nodes):
-        node_members[find(i)].append(pi)
+    # path edge endpoints in snapped node space
+    edges = []  # dicts
+    for i, p in enumerate(paths):
+        n0 = node_id(i, 0)
+        n1 = node_id(i, 1)
+        edges.append({
+            "edge_idx": i,
+            "path_local": i,
+            "n0": n0,
+            "n1": n1,
+            "style": (p["color"], p["width"]),
+            "length": p["length"],
+            "path_id": p["id"],
+            "segments": p["segments"],
+        })
 
-    adj = defaultdict(set)
-    for members in node_members.values():
-        uniq = sorted(set(members))
-        for a in range(len(uniq)):
-            for b in range(a + 1, len(uniq)):
-                u, v = uniq[a], uniq[b]
-                if style_key(paths[u]) == style_key(paths[v]):
-                    adj[u].add(v)
-                    adj[v].add(u)
-
-    # ------------------------------------------------------------------
-    # 3) Connected components per style
-    # ------------------------------------------------------------------
-    seen = set()
-    components = []  # list of list[local_idx]
-    for i in range(len(paths)):
-        if i in seen:
-            continue
-        stack = [i]
-        seen.add(i)
-        comp = []
-        while stack:
-            u = stack.pop()
-            comp.append(u)
-            for v in adj[u]:
-                if v not in seen:
-                    seen.add(v)
-                    stack.append(v)
-        components.append(comp)
+    # adjacency: node -> list of edge indices
+    adj = defaultdict(list)
+    for ei, e in enumerate(edges):
+        adj[e["n0"]].append(ei)
+        adj[e["n1"]].append(ei)
 
     # ------------------------------------------------------------------
-    # 4) Order a component into a contour by terminal walk
+    # 3) Contract degree-2 chains, then find cycles generically
     # ------------------------------------------------------------------
-    def order_component(comp):
-        if not comp:
-            return [], [], False, []
+    def other_node(edge_idx, node):
+        e = edges[edge_idx]
+        return e["n1"] if e["n0"] == node else e["n0"]
 
-        nmap = defaultdict(list)  # snapped node -> [(local_idx, term_i)]
-        for pi in comp:
-            for ti in (0, 1):
-                nmap[snap[(pi, ti)]].append((pi, ti))
+    used_edges = set()
 
-        # start at a true terminal if possible
-        start_p, start_t = comp[0], 0
-        for pi in comp:
-            for ti in (0, 1):
-                deg = len({p for p, _ in nmap[snap[(pi, ti)]]})
-                if deg == 1:
-                    start_p, start_t = pi, ti
-                    break
+    def walk_chain(start_edge, start_node):
+        """Follow unique degree-2 continuation; return edge list and end node."""
+        chain = [start_edge]
+        used_edges.add(start_edge)
+        prev = start_node
+        cur = other_node(start_edge, start_node)
 
-        unused = set(comp)
-        ordered = []
-        cur_p, cur_t = start_p, start_t
-        closed = False
-
-        while cur_p in unused:
-            unused.remove(cur_p)
-            ordered.append(cur_p)
-            other_t = 1 - cur_t
-            node = snap[(cur_p, other_t)]
-            cands = [(p, t) for p, t in nmap[node] if p in unused]
-            if not cands:
-                # close if back to start node
-                start_node = snap[(ordered[0], start_t)]
-                if node == start_node and len(ordered) >= 3:
-                    closed = True
+        while True:
+            cands = [ei for ei in adj[cur] if ei not in used_edges]
+            # only continue automatically through degree-2 corridor
+            if len(cands) != 1:
                 break
-            # prefer continuing to a path that keeps degree-2 flow
-            cands.sort(key=lambda pt: len({pp for pp, _ in nmap[snap[(pt[0], 1 - pt[1])]]}))
-            cur_p, cur_t = cands[0]
+            # also stop if node degree (all edges) != 2 and not continuing uniquely
+            deg = len(adj[cur])
+            if deg != 2 and len(cands) != 1:
+                break
+            nxt = cands[0]
+            # style consistency along main outline
+            if edges[nxt]["style"] != edges[chain[0]]["style"]:
+                break
+            used_edges.add(nxt)
+            chain.append(nxt)
+            prev, cur = cur, other_node(nxt, cur)
+            if cur == start_node:
+                break
+        return chain, cur
 
+    # Build maximal chains starting from every unused edge
+    chains = []  # each: {edge_indices, nodes, closed, style, length, segments, path_ids}
+    for ei in range(len(edges)):
+        if ei in used_edges:
+            continue
+        e = edges[ei]
+        # start from n0
+        chain_edges, end_node = walk_chain(ei, e["n0"])
+        start_node = e["n0"]
+
+        # reconstruct node sequence
+        nodes = [start_node]
+        cur = start_node
         segs = []
         path_ids = []
-        for pi in ordered:
-            segs.extend(paths[pi]["segments"])
-            path_ids.append(paths[pi]["id"])
+        length = 0.0
+        for ce in chain_edges:
+            ee = edges[ce]
+            segs.extend(ee["segments"])
+            path_ids.append(ee["path_id"])
+            length += ee["length"]
+            cur = other_node(ce, cur)
+            nodes.append(cur)
 
-        return segs, path_ids, closed, sorted(unused)
+        closed = (nodes[0] == nodes[-1] and len(chain_edges) >= 1)
+        # near-close single chain
+        if not closed and len(nodes) >= 2:
+            # map node -> sample xy
+            # use average of constituent terminal xys
+            pass
 
-    def chain_len(local_ids):
-        return sum(paths[i]["length"] for i in local_ids)
-
-    def segs_of(local_ids):
-        out = []
-        for i in local_ids:
-            out.extend(paths[i]["segments"])
-        return out
-
-    def endpoints_of_chain(local_ids):
-        if not local_ids:
-            return []
-        # use terminals that appear once in the chain
-        counts = Counter()
-        sample = {}
-        for pi in local_ids:
-            for ti, xy in enumerate(paths[pi]["terminals"]):
-                q = quant(xy)
-                counts[q] += 1
-                sample[q] = xy
-        ends = [sample[q] for q, n in counts.items() if n == 1]
-        if len(ends) >= 2:
-            return ends
-        # fallback: all terminals
-        ends = []
-        for pi in local_ids:
-            ends.extend(paths[pi]["terminals"])
-        return ends
-
-    # Build candidate contours from components
-    style_chains = []  # each: dict
-    for comp in components:
-        total = chain_len(comp)
-        if total < 20:
-            continue
-        segs, path_ids, closed, leftover = order_component(comp)
-        # If leftover exists, this component had branches; keep ordered part only
-        pts = []
-        if segs:
-            pts = [segs[0][0], segs[0][1]]
-            for a, b in segs[1:]:
-                if dist(pts[-1], a) <= dist(pts[-1], b):
-                    pts.append(b)
-                else:
-                    pts.append(a)
-
-        area = 0.0
-        if len(pts) >= 3:
-            if closed or dist(pts[0], pts[-1]) <= gap_threshold * 2:
-                closed = True
-                area = poly_area(pts)
-
-        style_chains.append({
-            "local_ids": [i for i in range(len(paths)) if paths[i]["id"] in path_ids],
-            "path_ids": path_ids,          # contour only from the walk
-            "segments": segs,
-            "length": sum(paths[i]["length"] for i in range(len(paths)) if paths[i]["id"] in set(path_ids)),
+        chains.append({
+            "edge_indices": chain_edges,
+            "nodes": nodes,
             "closed": closed,
-            "area": area,
-            "bbox": bbox_of_segs(segs),
-            "color": paths[comp[0]]["color"],
-            "width": paths[comp[0]]["width"],
-            "leftover_local": leftover,
-        })
-
-    # Fix local_ids properly from path_ids
-    id_to_local = {paths[i]["id"]: i for i in range(len(paths))}
-    for ch in style_chains:
-        ch["local_ids"] = [id_to_local[pid] for pid in ch["path_ids"] if pid in id_to_local]
-        ch["length"] = sum(paths[i]["length"] for i in ch["local_ids"])
-
-    # ------------------------------------------------------------------
-    # 5) Main pieces = largest closed / near-closed contours
-    # ------------------------------------------------------------------
-    mains = [c for c in style_chains
-             if c["closed"] and c["length"] >= min_perimeter and c["area"] >= min_polygon_area]
-    mains.sort(key=lambda c: c["area"], reverse=True)
-
-    # fallback: longest chains if no closed found
-    if not mains:
-        candidates = sorted(style_chains, key=lambda c: c["length"], reverse=True)
-        mains = [c for c in candidates if c["length"] >= min_perimeter][:15]
-
-    # Index remaining chains as option/dart candidates
-    main_path_id_set = set()
-    for m in mains:
-        main_path_id_set.update(m["path_ids"])
-
-    remaining = []
-    for ch in style_chains:
-        # skip chains fully used as mains
-        if ch in mains:
-            continue
-        # also skip if all path ids already in some main contour
-        if ch["path_ids"] and set(ch["path_ids"]).issubset(main_path_id_set):
-            continue
-        remaining.append(ch)
-
-    # Also create chains from leftover branch pieces inside components
-    for ch in style_chains:
-        if not ch["leftover_local"]:
-            continue
-        loc = ch["leftover_local"]
-        segs = segs_of(loc)
-        remaining.append({
-            "local_ids": loc,
-            "path_ids": [paths[i]["id"] for i in loc],
+            "style": e["style"],
+            "length": length,
             "segments": segs,
-            "length": chain_len(loc),
-            "closed": False,
-            "area": 0.0,
-            "bbox": bbox_of_segs(segs),
-            "color": paths[loc[0]]["color"],
-            "width": paths[loc[0]]["width"],
-            "leftover_local": [],
+            "path_ids": path_ids,
+            "start_node": nodes[0],
+            "end_node": nodes[-1],
         })
 
-    def outline_points(main):
-        # densify a bit from segments for attachment tests
+    # Build chain-graph at junction nodes for multi-chain cycles
+    # A "chain edge" connects start_node -- end_node if not already closed
+    chain_adj = defaultdict(list)  # node -> list of chain_idx
+    for ci, ch in enumerate(chains):
+        if ch["closed"]:
+            continue
+        chain_adj[ch["start_node"]].append(ci)
+        chain_adj[ch["end_node"]].append(ci)
+
+    def chain_other(ci, node):
+        ch = chains[ci]
+        return ch["end_node"] if ch["start_node"] == node else ch["start_node"]
+
+    # Enumerate simple cycles over chains (generic N-chain)
+    cycle_closed = []
+    # include already-closed contracted chains
+    for ch in chains:
+        if not ch["closed"]:
+            continue
+        # near-area
         pts = []
-        for a, b in main["segments"]:
+        for a, b in ch["segments"]:
             pts.append(a)
             pts.append(b)
-        return pts
+        # better ordered points:
+        pts = _ordered_points_from_segments(ch["segments"], dist)
+        area = poly_area(pts) if len(pts) >= 3 else 0.0
+        cycle_closed.append({
+            "path_ids": list(ch["path_ids"]),
+            "segments": list(ch["segments"]),
+            "length": ch["length"],
+            "area": area,
+            "bbox": bbox_of_segs(ch["segments"]),
+            "style": ch["style"],
+            "closed": True,
+        })
 
-    def attaches_to_main(chain, main_pts):
-        ends = endpoints_of_chain(chain["local_ids"])
-        if not ends or not main_pts:
+    # DFS cycles among open chains
+    used_chain_in_cycle = set()
+
+    def points_for_chain_sequence(chain_idxs):
+        segs = []
+        pids = []
+        length = 0.0
+        style = chains[chain_idxs[0]]["style"]
+        for ci in chain_idxs:
+            ch = chains[ci]
+            segs.extend(ch["segments"])
+            pids.extend(ch["path_ids"])
+            length += ch["length"]
+        pts = _ordered_points_from_segments(segs, dist)
+        area = poly_area(pts) if len(pts) >= 3 else 0.0
+        return segs, pids, length, area, style, pts
+
+    # For each open chain, try to find a return cycle
+    for start_ci, ch0 in enumerate(chains):
+        if ch0["closed"]:
+            continue
+        if start_ci in used_chain_in_cycle:
+            continue
+        start = ch0["start_node"]
+        # DFS: state = (node, path_chains, visited_chains)
+        stack = [(ch0["end_node"], [start_ci], {start_ci})]
+        found = None
+        while stack:
+            node, path_c, vis = stack.pop()
+            if node == start and len(path_c) >= 2:
+                found = path_c
+                break
+            if len(path_c) > 80:  # safety
+                continue
+            for nci in chain_adj.get(node, []):
+                if nci in vis:
+                    continue
+                if chains[nci]["style"] != ch0["style"]:
+                    continue
+                nnode = chain_other(nci, node)
+                stack.append((nnode, path_c + [nci], vis | {nci}))
+        if not found:
+            # also near-cycle: ends within gap after one chain
+            # handled below
+            continue
+
+        segs, pids, length, area, style, pts = points_for_chain_sequence(found)
+        if length >= min_perimeter * 0.5:
+            cycle_closed.append({
+                "path_ids": pids,
+                "segments": segs,
+                "length": length,
+                "area": area,
+                "bbox": bbox_of_segs(segs),
+                "style": style,
+                "closed": True,
+            })
+            used_chain_in_cycle.update(found)
+
+    # Near-cycles: open chain whose endpoints are close
+    node_xy = defaultdict(list)
+    for ti, (pi, ei, xy, style) in enumerate(terms):
+        node_xy[find(ti)].append(xy)
+
+    def node_point(nid):
+        arr = node_xy.get(nid) or [(0.0, 0.0)]
+        return (sum(p[0] for p in arr) / len(arr),
+                sum(p[1] for p in arr) / len(arr))
+
+    for ci, ch in enumerate(chains):
+        if ch["closed"] or ci in used_chain_in_cycle:
+            continue
+        p0 = node_point(ch["start_node"])
+        p1 = node_point(ch["end_node"])
+        if dist(p0, p1) <= gap_threshold * 2:
+            pts = _ordered_points_from_segments(ch["segments"], dist)
+            area = poly_area(pts) if len(pts) >= 3 else 0.0
+            cycle_closed.append({
+                "path_ids": list(ch["path_ids"]),
+                "segments": list(ch["segments"]),
+                "length": ch["length"],
+                "area": area,
+                "bbox": bbox_of_segs(ch["segments"]),
+                "style": ch["style"],
+                "closed": True,
+            })
+            used_chain_in_cycle.add(ci)
+
+    # ------------------------------------------------------------------
+    # 4) Select main pieces from cycles
+    # ------------------------------------------------------------------
+    mains = [
+        c for c in cycle_closed
+        if c["length"] >= min_perimeter and c["area"] >= min_polygon_area
+    ]
+    # dedupe by path set
+    mains = _dedupe_cycles(mains)
+    mains.sort(key=lambda c: c["area"], reverse=True)
+
+    main_path_ids = set()
+    for m in mains:
+        main_path_ids.update(m["path_ids"])
+
+    # Leftover open chains not used in mains
+    leftovers = []
+    for ci, ch in enumerate(chains):
+        if ci in used_chain_in_cycle and set(ch["path_ids"]).issubset(main_path_ids):
+            continue
+        if set(ch["path_ids"]) & main_path_ids == set(ch["path_ids"]) and ch["path_ids"]:
+            continue
+        if not ch["path_ids"]:
+            continue
+        # skip if fully consumed by a main
+        if ch["path_ids"] and set(ch["path_ids"]).issubset(main_path_ids):
+            continue
+        leftovers.append(ch)
+
+    # ------------------------------------------------------------------
+    # 5) Attach darts + length options
+    # ------------------------------------------------------------------
+    def attaches(chain_segs, main_segs):
+        if not chain_segs or not main_segs:
             return False
-        # subsample main outline for speed
-        step = max(1, len(main_pts) // 200)
-        sample = main_pts[::step]
+        ends = [chain_segs[0][0], chain_segs[0][1],
+                chain_segs[-1][0], chain_segs[-1][1]]
+        sample = []
+        step = max(1, len(main_segs) // 100)
+        for a, b in main_segs[::step]:
+            sample.append(a)
+            sample.append(b)
         for e in ends:
             for p in sample:
                 if dist(e, p) <= attach_tol:
                     return True
         return False
 
-    def mostly_inside_bbox(chain, bbox, pad=25.0):
+    def inside_bbox(segs, bbox, pad=30.0):
         x0, y0, x1, y1 = bbox
-        pts = []
-        for a, b in chain["segments"]:
-            pts.append(a)
-            pts.append(b)
+        pts = [p for s in segs for p in s]
         if not pts:
             return False
-        inside = 0
-        for p in pts:
-            if (x0 - pad <= p[0] <= x1 + pad) and (y0 - pad <= p[1] <= y1 + pad):
-                inside += 1
-        return inside >= 0.6 * len(pts)
+        ok = sum(1 for p in pts
+                 if x0-pad <= p[0] <= x1+pad and y0-pad <= p[1] <= y1+pad)
+        return ok >= 0.6 * len(pts)
 
-    # ------------------------------------------------------------------
-    # 6) For each main: group remaining by style → one option per style
-    # ------------------------------------------------------------------
     pieces = []
-    used_remaining = set()
+    used_left = set()
 
-    for mi, main in enumerate(mains):
-        main_pts = outline_points(main)
-        main_style = (main["color"], main["width"])
-
-        # collect candidate locals near this main, not same contour paths
-        cand_idxs = []
-        for ri, ch in enumerate(remaining):
-            if ri in used_remaining:
-                continue
-            if set(ch["path_ids"]) & set(main["path_ids"]):
-                continue
-            if not mostly_inside_bbox(ch, main["bbox"]) and not attaches_to_main(ch, main_pts):
-                continue
-            cand_idxs.append(ri)
-
-        # Darts: same style, short, attached/inside
+    for m in mains:
         darts = []
-        option_pool = []  # remaining candidates for size options
-
-        for ri in cand_idxs:
-            ch = remaining[ri]
-            ch_style = (ch["color"], ch["width"])
-            if ch_style == main_style and ch["length"] <= max_dart_length:
-                darts.append({
-                    "segments": ch["segments"],
-                    "path_ids": ch["path_ids"],
-                    "length": ch["length"],
-                    "color": ch["color"],
-                })
-                used_remaining.add(ri)
-            else:
-                option_pool.append(ri)
-
-        # Group option pool by colour/style and merge into one option per style
+        # group leftover by style
         style_groups = defaultdict(list)
-        for ri in option_pool:
-            ch = remaining[ri]
-            style_groups[(ch["color"], ch["width"])].append(ri)
+        for li, ch in enumerate(leftovers):
+            if li in used_left:
+                continue
+            if set(ch["path_ids"]) & set(m["path_ids"]):
+                continue
+            if not inside_bbox(ch["segments"], m["bbox"]) and not attaches(ch["segments"], m["segments"]):
+                continue
+            style_groups[ch["style"]].append(li)
 
         variants = []
-        for st, rlist in style_groups.items():
-            if st == main_style:
-                # same style leftovers that weren't short enough for dart:
-                # ignore as options (prevents dark fragments becoming "options")
-                continue
-
-            # merge all chains of this style near the piece into one option
-            local_ids = []
+        for st, lis in style_groups.items():
             segs = []
             pids = []
             length = 0.0
-            for ri in rlist:
-                ch = remaining[ri]
-                # require attachment for at least one chain of this style
-                local_ids.extend(ch["local_ids"])
+            for li in lis:
+                ch = leftovers[li]
                 segs.extend(ch["segments"])
                 pids.extend(ch["path_ids"])
                 length += ch["length"]
 
+            if st == m["style"]:
+                if length <= max_dart_length and length > 0:
+                    darts.append({
+                        "segments": segs,
+                        "path_ids": sorted(set(pids)),
+                        "length": length,
+                        "color": st[0],
+                    })
+                    used_left.update(lis)
+                continue
+
             if length < min_option_length:
                 continue
-
-            # must attach to main outline
-            tmp = {
-                "local_ids": local_ids,
-                "segments": segs,
-            }
-            if not attaches_to_main(tmp, main_pts):
-                # try weaker: any endpoint near main bbox edge already filtered;
-                # still require geometric attach
+            if not attaches(segs, m["segments"]):
                 continue
-
             variants.append({
                 "segments": segs,
                 "path_ids": sorted(set(pids)),
@@ -602,26 +617,66 @@ def detect_patterns(page,
                 "color": st[0],
                 "width": st[1],
             })
-            for ri in rlist:
-                used_remaining.add(ri)
+            used_left.update(lis)
 
         variants.sort(key=lambda v: v["length"], reverse=True)
-
         pieces.append({
-            "segments": main["segments"],
-            "bbox": main["bbox"],
-            "area": main["area"],
-            "perimeter": main["length"],
-            "path_ids": list(main["path_ids"]),  # contour only
+            "segments": m["segments"],
+            "bbox": m["bbox"],
+            "area": m["area"],
+            "perimeter": m["length"],
+            "path_ids": list(dict.fromkeys(m["path_ids"])),  # unique, contour only
             "darts": darts,
             "size_variants": variants,
-            "closed": main["closed"],
+            "closed": True,
         })
 
     print(f"Pattern pieces kept: {len(pieces)}")
     for i, p in enumerate(pieces):
-        print(f"  [{i}] paths={len(p['path_ids'])} options={len(p['size_variants'])} darts={len(p['darts'])}")
+        print(f"  [{i}] paths={len(p['path_ids'])} options={len(p['size_variants'])} "
+              f"darts={len(p['darts'])} area={p['area']:.0f}")
     return pieces
+
+
+def _ordered_points_from_segments(segs, dist_fn):
+    if not segs:
+        return []
+    pts = [segs[0][0], segs[0][1]]
+    for a, b in segs[1:]:
+        if dist_fn(pts[-1], a) <= dist_fn(pts[-1], b):
+            pts.append(b)
+        else:
+            pts.append(a)
+    return pts
+
+
+def _dedupe_cycles(cycles):
+    out = []
+    seen = []
+    for c in cycles:
+        key = frozenset(c["path_ids"])
+        if not key:
+            continue
+        dup = False
+        for s in seen:
+            # if heavily overlapping path sets, keep larger area only
+            inter = len(key & s)
+            if inter and inter >= 0.8 * min(len(key), len(s)):
+                dup = True
+                break
+        if dup:
+            # replace if bigger area
+            for i, s in enumerate(seen):
+                inter = len(key & s)
+                if inter and inter >= 0.8 * min(len(key), len(s)):
+                    if c["area"] > out[i]["area"]:
+                        out[i] = c
+                        seen[i] = key
+                    break
+            continue
+        seen.append(key)
+        out.append(c)
+    return out
 
 
 # ------------------------------------------------------------------
