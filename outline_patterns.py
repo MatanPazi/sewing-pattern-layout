@@ -126,7 +126,6 @@ def detect_patterns(page,
                     min_perimeter=250.0,
                     min_polygon_area=8000.0,
                     min_option_length=60.0,
-                    max_dart_length=220.0,
                     attach_tol=12.0):
     """
     Goal 2 pattern detection via generic geometric graph cycles.
@@ -135,7 +134,6 @@ def detect_patterns(page,
     - Same-style terminals snap within gap_threshold
     - Closed outlines = cycles of any number of paths
     - Near-cycles allowed when chain ends are within gap
-    - Darts = short same-style leftovers
     - Length options = one joined chain per alternate style attached to a main cycle
     """
     from collections import defaultdict, Counter
@@ -541,15 +539,16 @@ def detect_patterns(page,
         leftovers.append(ch)
 
     # ------------------------------------------------------------------
-    # 5) Attach darts + length options
+    # 5) Attach length options
+    #    Options must be endpoint-connected chains (not style bags).
     # ------------------------------------------------------------------
     def attaches(chain_segs, main_segs):
         if not chain_segs or not main_segs:
             return False
         ends = [chain_segs[0][0], chain_segs[0][1],
                 chain_segs[-1][0], chain_segs[-1][1]]
-        sample = []
         step = max(1, len(main_segs) // 100)
+        sample = []
         for a, b in main_segs[::step]:
             sample.append(a)
             sample.append(b)
@@ -564,69 +563,165 @@ def detect_patterns(page,
         pts = [p for s in segs for p in s]
         if not pts:
             return False
-        ok = sum(1 for p in pts
-                 if x0-pad <= p[0] <= x1+pad and y0-pad <= p[1] <= y1+pad)
+        ok = sum(
+            1 for p in pts
+            if x0 - pad <= p[0] <= x1 + pad and y0 - pad <= p[1] <= y1 + pad
+        )
         return ok >= 0.6 * len(pts)
 
+    def chain_extent(segs):
+        if not segs:
+            return 0.0
+        xs = [p[0] for s in segs for p in s]
+        ys = [p[1] for s in segs for p in s]
+        return max(max(xs) - min(xs), max(ys) - min(ys))
+
+    # Flatten leftover paths to path-level records with terminals
+    # (reuse original path terminals when possible)
+    id_to_path = {p["id"]: p for p in paths}
+
+    def leftover_path_records(ch):
+        """Expand a leftover chain into individual path records."""
+        recs = []
+        for pid in ch["path_ids"]:
+            p = id_to_path.get(pid)
+            if p is None:
+                continue
+            recs.append(p)
+        return recs
+
+    def connect_paths_into_components(path_recs, gap):
+        """
+        Same-style endpoint connection → connected components.
+        Returns list of components, each = list of path records.
+        """
+        if not path_recs:
+            return []
+
+        # only connect within identical style
+        by_style = defaultdict(list)
+        for i, p in enumerate(path_recs):
+            by_style[(p["color"], p["width"])].append(i)
+
+        components = []
+        for style, idxs in by_style.items():
+            parent = {i: i for i in idxs}
+
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a, b):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[rb] = ra
+
+            # endpoint proximity among this style only
+            terms = []  # (local_idx, xy)
+            for i in idxs:
+                p = path_recs[i]
+                terms.append((i, p["t0"]))
+                terms.append((i, p["t1"]))
+
+            cell = max(gap * 1.5, 4.0)
+            grid = defaultdict(list)
+            for ti, (i, xy) in enumerate(terms):
+                grid[(int(xy[0] // cell), int(xy[1] // cell))].append(ti)
+
+            neigh = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+            for ti, (i, xy) in enumerate(terms):
+                cx, cy = int(xy[0] // cell), int(xy[1] // cell)
+                for dx, dy in neigh:
+                    for tj in grid.get((cx + dx, cy + dy), []):
+                        if tj <= ti:
+                            continue
+                        j, xy2 = terms[tj]
+                        if i == j:
+                            continue
+                        if dist(xy, xy2) <= gap:
+                            union(i, j)
+
+            groups = defaultdict(list)
+            for i in idxs:
+                groups[find(i)].append(path_recs[i])
+            components.extend(groups.values())
+
+        return components
+
     pieces = []
-    used_left = set()
+    used_path_ids = set()
 
     for m in mains:
-        darts = []
-        # group leftover by style
-        style_groups = defaultdict(list)
-        for li, ch in enumerate(leftovers):
-            if li in used_left:
+        # Candidate leftovers near this main
+        candidate_paths = []
+        seen_pid = set()
+        for ch in leftovers:
+            if not ch["path_ids"]:
                 continue
             if set(ch["path_ids"]) & set(m["path_ids"]):
                 continue
             if not inside_bbox(ch["segments"], m["bbox"]) and not attaches(ch["segments"], m["segments"]):
                 continue
-            style_groups[ch["style"]].append(li)
+            for p in leftover_path_records(ch):
+                if p["id"] in seen_pid or p["id"] in used_path_ids:
+                    continue
+                if p["id"] in set(m["path_ids"]):
+                    continue
+                seen_pid.add(p["id"])
+                candidate_paths.append(p)
+
+        # CRITICAL: connect by endpoints, not by style bag
+        comps = connect_paths_into_components(candidate_paths, gap_threshold)
 
         variants = []
-        for st, lis in style_groups.items():
+        main_style = m["style"]
+
+        for comp in comps:
             segs = []
             pids = []
             length = 0.0
-            for li in lis:
-                ch = leftovers[li]
-                segs.extend(ch["segments"])
-                pids.extend(ch["path_ids"])
-                length += ch["length"]
+            for p in comp:
+                segs.extend(p["segments"])
+                pids.append(p["id"])
+                length += p["length"]
 
-            if st == m["style"]:
-                if length <= max_dart_length and length > 0:
-                    darts.append({
-                        "segments": segs,
-                        "path_ids": sorted(set(pids)),
-                        "length": length,
-                        "color": st[0],
-                    })
-                    used_left.update(lis)
+            if not segs:
                 continue
 
+            style = (comp[0]["color"], comp[0]["width"])
+            extent = chain_extent(segs)
+
+            # Same style as outline → ignore (no darts)
+            if style == main_style:
+                continue
+
+            # Alternate style → length option only if connected + long enough
             if length < min_option_length:
+                continue
+            if extent < min_option_length * 0.5:
                 continue
             if not attaches(segs, m["segments"]):
                 continue
+
             variants.append({
                 "segments": segs,
                 "path_ids": sorted(set(pids)),
                 "length": length,
-                "color": st[0],
-                "width": st[1],
+                "color": style[0],
+                "width": style[1],
             })
-            used_left.update(lis)
+            used_path_ids.update(pids)
 
         variants.sort(key=lambda v: v["length"], reverse=True)
+
         pieces.append({
             "segments": m["segments"],
             "bbox": m["bbox"],
             "area": m["area"],
             "perimeter": m["length"],
-            "path_ids": list(dict.fromkeys(m["path_ids"])),  # unique, contour only
-            "darts": darts,
+            "path_ids": list(dict.fromkeys(m["path_ids"])),
             "size_variants": variants,
             "closed": True,
         })
@@ -634,7 +729,7 @@ def detect_patterns(page,
     print(f"Pattern pieces kept: {len(pieces)}")
     for i, p in enumerate(pieces):
         print(f"  [{i}] paths={len(p['path_ids'])} options={len(p['size_variants'])} "
-              f"darts={len(p['darts'])} area={p['area']:.0f}")
+              f"area={p['area']:.0f}")
     return pieces
 
 
@@ -838,7 +933,7 @@ def detect_special_lines(page,
 def write_patterns_txt(pieces, out_path: Path):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"# Pattern pieces: {len(pieces)}\n")
-        f.write("# Goal 2 format: main outline + darts + size/length options\n\n")
+        f.write("# Goal 2 format: main outline + size/length options\n\n")
 
         for i, p in enumerate(pieces):
             f.write(f"PIECE {i}\n")
@@ -850,17 +945,6 @@ def write_patterns_txt(pieces, out_path: Path):
             f.write(f"  segments  : {len(p.get('segments', []))}\n")
             for s in p.get("segments", []):
                 f.write(f"    {s[0]} -> {s[1]}\n")
-
-            darts = p.get("darts", []) or []
-            f.write(f"  darts     : {len(darts)}\n")
-            for di, d in enumerate(darts):
-                f.write(f"    DART {di}\n")
-                f.write(f"      length   : {d.get('length', 0.0):.1f}\n")
-                f.write(f"      color    : {d.get('color')}\n")
-                f.write(f"      path_ids : {d.get('path_ids', [])}\n")
-                f.write(f"      segments : {len(d.get('segments', []))}\n")
-                for s in d.get("segments", []):
-                    f.write(f"        {s[0]} -> {s[1]}\n")
 
             variants = p.get("size_variants", []) or []
             f.write(f"  options   : {len(variants)}\n")
@@ -965,21 +1049,6 @@ def render(page, objects, mode, out_path: Path):
                     zorder=5,
                 )
 
-            # Darts dimmed
-            for di, dart in enumerate(piece.get("darts", []) or []):
-                segs = dart.get("segments") or []
-                if not segs:
-                    continue
-                lc = LineCollection(
-                    segs,
-                    colors=["0.45"],
-                    linewidths=1.2,
-                    alpha=0.7,
-                    linestyles=":",
-                    zorder=2,
-                )
-                ax.add_collection(lc)
-
             # BBox + piece index
             x0, y0, x1, y1 = piece["bbox"]
             rect = Rectangle(
@@ -1009,7 +1078,7 @@ def render(page, objects, mode, out_path: Path):
         ax.text(
             page_rect.x0 + 10,
             page_rect.y0 + 20,
-            "Solid coloured = main outline\nOrange = length options\nGrey dotted = darts",
+            "Solid coloured = main outline\nOrange = length options\n",
             fontsize=8,
             color="black",
             bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=3),
@@ -1056,7 +1125,6 @@ def main():
     parser.add_argument("--min-perimeter", type=float, default=250.0)
     parser.add_argument("--min-area", type=float, default=8000.0)
     parser.add_argument("--min-option-length", type=float, default=80.0)
-    parser.add_argument("--max-dart-length", type=float, default=220.0)
 
     # line params
     parser.add_argument("--min-shaft", type=float, default=35.0)
@@ -1080,7 +1148,6 @@ def main():
             min_perimeter=args.min_perimeter,
             min_polygon_area=args.min_area,
             min_option_length=args.min_option_length,
-            max_dart_length=args.max_dart_length,
         )
         print(f"Found {len(pieces)} pattern piece(s)")
         write_patterns_txt(pieces, out_dir / f"{stem}_patterns.txt")
