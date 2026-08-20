@@ -1176,4 +1176,5 @@ if __name__ == "__main__":
 
 
 # TODO:
-# Improve detect_patterns runtime
+# Add regression tests
+# Add support for pattern pieces spanning 2 (Or more than 1) pages.
