@@ -774,153 +774,368 @@ def _dedupe_cycles(cycles):
     return out
 
 
-# ------------------------------------------------------------------
-# SPECIAL LINES detection (grain / fold)
-# ------------------------------------------------------------------
 def detect_special_lines(page,
                          min_shaft_length=35.0,
-                         arrow_search_radius=8.0,
+                         arrow_search_radius=12.0,
                          max_arrow_size=35.0,
                          max_arrow_segments=30,
                          min_arrow_width=0.7,
-                         point_tol=1.0):
+                         point_tol=1.0,
+                         min_crossbar_length=8.0,
+                         max_crossbar_length=90.0,
+                         join_gap=8.0,
+                         collinear_dot_min=0.98,
+                         perp_dot_max=0.35,
+                         min_fold_ends=1):
     """
-    Detect grain / fold lines.
+    Unified grain/fold detection from straight runs + arrow sites.
+
+    Grain: long run with arrow(s) near its own endpoints.
+    Fold:  long run with short perpendicular run(s) at end(s)
+           and arrow(s) near the outer end of those short runs.
+
+    Crossbars used by a fold are consumed so they are not also
+    reported as grain lines.
     """
-    from collections import Counter
+    from collections import defaultdict
+    import math
 
     drawings = page.get_drawings()
 
-    shafts = []
-    arrow_candidates = []
-
-    def quantize(p):
+    def quant(p):
         return (round(p[0] / point_tol), round(p[1] / point_tol))
 
-    def geometric_terminals(segs):
-        counts = Counter()
-        examples = {}
-        for a, b in segs:
-            qa, qb = quantize(a), quantize(b)
-            counts[qa] += 1
-            counts[qb] += 1
-            examples[qa] = a
-            examples[qb] = b
+    def dist(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
 
-        terminals = [examples[q] for q, c in counts.items() if c == 1]
+    def sub(a, b):
+        return (a[0] - b[0], a[1] - b[1])
 
-        if len(terminals) < 2:
-            pts = [p for s in segs for p in s]
-            max_d = -1.0
-            ep1 = ep2 = pts[0]
-            for i in range(len(pts)):
-                for j in range(i + 1, len(pts)):
-                    d = point_distance(pts[i], pts[j])
-                    if d > max_d:
-                        max_d = d
-                        ep1, ep2 = pts[i], pts[j]
-            terminals = [ep1, ep2]
+    def nrm(v):
+        l = math.hypot(v[0], v[1])
+        if l < 1e-12:
+            return (0.0, 0.0)
+        return (v[0] / l, v[1] / l)
 
-        if len(terminals) > 2:
-            max_d = -1.0
-            best = (terminals[0], terminals[1])
-            for i in range(len(terminals)):
-                for j in range(i + 1, len(terminals)):
-                    d = point_distance(terminals[i], terminals[j])
-                    if d > max_d:
-                        max_d = d
-                        best = (terminals[i], terminals[j])
-            terminals = list(best)
+    def dot(u, v):
+        return u[0] * v[0] + u[1] * v[1]
 
-        return tuple(terminals[:2])
+    # ------------------------------------------------------------------
+    # 1) Straight "l" segments + arrow sites
+    # ------------------------------------------------------------------
+    segments = []
+    arrow_sites = []
+    arrow_paths = []
 
-    def has_long_straight_segment(path, min_len):
-        """
-        True if the original path contains at least one straight 'l' segment
-        long enough to be a real shaft edge.
-        """
-        for item in path.get("items", []):
+    for path_idx, path in enumerate(drawings):
+        width = float(path.get("width") or 0.0)
+        color = path.get("color")
+        items = path.get("items", [])
+
+        r = path.get("rect")
+        segs_all = path_to_segments(path)
+        if r is not None and segs_all:
+            size = max(r.width, r.height)
+            nseg = len(segs_all)
+            thin = 0 < width < min_arrow_width
+            if size <= max_arrow_size and nseg <= max_arrow_segments and not thin:
+                arrow_paths.append({
+                    "path": path,
+                    "segments": segs_all,
+                    "center": ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2),
+                })
+                arrow_sites.append(((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2))
+                for a, b in segs_all:
+                    arrow_sites.append(a)
+                    arrow_sites.append(b)
+
+        for item in items:
             if item[0] != "l":
                 continue
             p1, p2 = item[1], item[2]
-            if point_distance((p1.x, p1.y), (p2.x, p2.y)) >= min_len:
+            a = (p1.x, p1.y)
+            b = (p2.x, p2.y)
+            length = dist(a, b)
+            if length < 1.0:
+                continue
+            d = nrm(sub(b, a))
+            segments.append({
+                "a": a,
+                "b": b,
+                "length": length,
+                "dir": d,
+                "width": round(width, 2),
+                "color": tuple(round(float(c), 3) for c in color[:3]) if color else None,
+                "path": path,
+                "path_id": path_idx,
+            })
+
+    if not segments:
+        return []
+
+    # ------------------------------------------------------------------
+    # 2) Merge collinear endpoint-linked segments into runs
+    # ------------------------------------------------------------------
+    parent = list(range(len(segments)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    cell = max(join_gap * 1.5, 4.0)
+    grid = defaultdict(list)
+
+    def cell_of(p):
+        return (int(p[0] // cell), int(p[1] // cell))
+
+    for i, s in enumerate(segments):
+        grid[cell_of(s["a"])].append((i, "a"))
+        grid[cell_of(s["b"])].append((i, "b"))
+
+    neigh = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+
+    for i, s in enumerate(segments):
+        for ep_name, ep in (("a", s["a"]), ("b", s["b"])):
+            cx, cy = cell_of(ep)
+            for dx, dy in neigh:
+                for j, other_ep_name in grid.get((cx + dx, cy + dy), []):
+                    if j <= i:
+                        continue
+                    t = segments[j]
+                    if s["width"] != t["width"] or s["color"] != t["color"]:
+                        continue
+                    q = t[other_ep_name]
+                    if dist(ep, q) > join_gap:
+                        continue
+                    if abs(dot(s["dir"], t["dir"])) < collinear_dot_min:
+                        continue
+                    union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(len(segments)):
+        groups[find(i)].append(i)
+
+    runs = []
+    for idxs in groups.values():
+        segs = [segments[i] for i in idxs]
+        length = sum(s["length"] for s in segs)
+        longest = max(segs, key=lambda s: s["length"])
+        direction = longest["dir"]
+
+        counts = defaultdict(int)
+        sample = {}
+        for s in segs:
+            for p in (s["a"], s["b"]):
+                qp = quant(p)
+                counts[qp] += 1
+                sample[qp] = p
+        terminals = [sample[q] for q, c in counts.items() if c == 1]
+
+        if len(terminals) < 2:
+            pts = [p for s in segs for p in (s["a"], s["b"])]
+            best_d = -1.0
+            t0 = t1 = pts[0]
+            for i in range(len(pts)):
+                for j in range(i + 1, len(pts)):
+                    d = dist(pts[i], pts[j])
+                    if d > best_d:
+                        best_d = d
+                        t0, t1 = pts[i], pts[j]
+            terminals = [t0, t1]
+        elif len(terminals) > 2:
+            best_d = -1.0
+            t0, t1 = terminals[0], terminals[1]
+            for i in range(len(terminals)):
+                for j in range(i + 1, len(terminals)):
+                    d = dist(terminals[i], terminals[j])
+                    if d > best_d:
+                        best_d = d
+                        t0, t1 = terminals[i], terminals[j]
+            terminals = [t0, t1]
+
+        draw_segs = [(s["a"], s["b"]) for s in segs]
+        path_ids = sorted({s["path_id"] for s in segs})
+
+        runs.append({
+            "seg_idxs": list(idxs),
+            "segments": draw_segs,
+            "max_l": max(s["length"] for s in segs),
+            "length": length,
+            "direction": direction,
+            "terminals": (terminals[0], terminals[1]),
+            "width": longest["width"],
+            "color": longest["color"],
+            "path_ids": path_ids,
+        })
+
+    long_runs = [r for r in runs if r["max_l"] >= min_shaft_length]
+    long_runs.sort(key=lambda r: r["max_l"], reverse=True) # longest first
+
+    short_runs = [
+        r for r in runs
+        if min_crossbar_length <= r["length"] <= max_crossbar_length
+    ]
+
+    def arrow_near(point, radius):
+        for p in arrow_sites:
+            if dist(p, point) <= radius:
                 return True
         return False
 
-    for path in drawings:
-        segs = path_to_segments(path)
-        if not segs:
-            continue
-
-        length = sum(segment_length(s) for s in segs)
-        r = path.get("rect")
-        if r is None:
-            continue
-
-        width = path.get("width") or 0.0
-        num_segments = len(segs)
-
-        # ---------- potential shaft ----------
-        is_stroked = path.get("color") is not None or width > 0
-        if is_stroked and length >= min_shaft_length:
-            # Has at least one long straight "l"
-            if not has_long_straight_segment(path, min_shaft_length):
-                pass  # reject as shaft
-            else:
-                endpoints = geometric_terminals(segs)
-                shafts.append({
-                    "path": path,
-                    "segments": segs,
-                    "length": length,
-                    "endpoints": endpoints,
-                    "rect": r,
-                    "num_segments": num_segments,
-                })
-
-        # ---------- potential external arrowhead ----------
-        size = max(r.width, r.height)
-        if size > max_arrow_size:
-            continue
-        if num_segments > max_arrow_segments:
-            continue
-        if 0 < width < min_arrow_width:
-            continue
-
-        arrow_candidates.append({
-            "path": path,
-            "segments": segs,
-            "rect": r,
-            "center": ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2),
-        })
-
-    results = []
-    for shaft in shafts:
-        ep1, ep2 = shaft["endpoints"]
-        nearby = []
-
-        for arrow in arrow_candidates:
-            if arrow["path"] is shaft["path"]:
+    def arrows_for_render(point, radius):
+        out = []
+        for ap in arrow_paths:
+            if dist(ap["center"], point) <= radius:
+                out.append(ap)
                 continue
-            d1 = point_distance(arrow["center"], ep1)
-            d2 = point_distance(arrow["center"], ep2)
-            if min(d1, d2) <= arrow_search_radius:
-                nearby.append(arrow)
+            for a, b in ap["segments"]:
+                if dist(a, point) <= radius or dist(b, point) <= radius:
+                    out.append(ap)
+                    break
+        return out
 
-        # still allow a single arrowhead
-        if not nearby:
+    # ------------------------------------------------------------------
+    # 3) Classify each long run (longest first; consume fold crossbars)
+    # ------------------------------------------------------------------
+    results = []
+    used_seg_idxs = set()
+
+    for L in long_runs:
+        # skip if this run was already used as a fold crossbar / shaft
+        if set(L["seg_idxs"]) & used_seg_idxs:
             continue
 
-        line_type = "grain" if shaft["num_segments"] == 1 else "fold"
-        score = len(nearby)
+        ep1, ep2 = L["terminals"]
+        ldir = L["direction"]
+
+        # Grain ends
+        grain_ends = []
+        grain_arrows = []
+        for ep in (ep1, ep2):
+            if arrow_near(ep, arrow_search_radius):
+                grain_ends.append(ep)
+                grain_arrows.extend(arrows_for_render(ep, arrow_search_radius))
+
+        # Fold ends: external short perpendicular runs
+        fold_ends = 0
+        fold_bars = []
+        fold_arrows = []
+
+        for ep in (ep1, ep2):
+            best = None  # (inner_dist, short_run, outer, arrows)
+            for S in short_runs:
+                if set(S["seg_idxs"]) & set(L["seg_idxs"]):
+                    continue
+                if set(S["seg_idxs"]) & used_seg_idxs:
+                    continue
+                if abs(dot(ldir, S["direction"])) > perp_dot_max:
+                    continue
+
+                s0, s1 = S["terminals"]
+                d0 = dist(s0, ep)
+                d1 = dist(s1, ep)
+                if min(d0, d1) > join_gap:
+                    continue
+
+                if d0 <= d1:
+                    inner, outer, inner_d = s0, s1, d0
+                else:
+                    inner, outer, inner_d = s1, s0, d1
+
+                if not arrow_near(outer, arrow_search_radius):
+                    continue
+
+                arr = arrows_for_render(outer, arrow_search_radius)
+                if best is None or inner_d < best[0]:
+                    best = (inner_d, S, outer, arr)
+
+            if best is not None:
+                fold_ends += 1
+                fold_bars.append(best[1])
+                fold_arrows.extend(best[3])
+
+        is_fold = fold_ends >= min_fold_ends
+        is_grain = len(grain_ends) >= 1
+
+        # Single-path U: short perp arms live inside the same long run
+        if not is_fold and is_grain:
+            own_short_perp = 0
+            own_arrows = []
+            for ep in (ep1, ep2):
+                for si in L["seg_idxs"]:
+                    s = segments[si]
+                    if s["length"] < min_crossbar_length or s["length"] > max_crossbar_length:
+                        continue
+                    if abs(dot(ldir, s["dir"])) > perp_dot_max:
+                        continue
+                    d0 = dist(s["a"], ep)
+                    d1 = dist(s["b"], ep)
+                    if min(d0, d1) > join_gap:
+                        continue
+                    outer = s["b"] if d0 <= d1 else s["a"]
+                    if dist(outer, ep) < min_crossbar_length * 0.5:
+                        continue
+                    if arrow_near(outer, arrow_search_radius):
+                        own_short_perp += 1
+                        own_arrows.extend(arrows_for_render(outer, arrow_search_radius))
+                        break
+            if own_short_perp >= min_fold_ends:
+                is_fold = True
+                fold_arrows = own_arrows
+
+        if not is_fold and not is_grain:
+            continue
+
+        if is_fold:
+            line_type = "fold"
+            arrows = fold_arrows
+            score = 100 + fold_ends * 10 + len(arrows)
+            # consume shaft + crossbars so crossbars are not reported as grain
+            used_seg_idxs.update(L["seg_idxs"])
+            for b in fold_bars:
+                used_seg_idxs.update(b["seg_idxs"])
+        else:
+            line_type = "grain"
+            arrows = grain_arrows
+            score = len(grain_ends) * 10 + len(arrows)
+            used_seg_idxs.update(L["seg_idxs"])
+
+        # de-dup arrows
+        uniq = {}
+        for a in arrows:
+            uniq[id(a["path"])] = a
+        arrows = list(uniq.values())
+
+        extra = []
+        if is_fold:
+            for b in fold_bars:
+                extra.extend(b["segments"])
+        for a in arrows:
+            extra.extend(a["segments"])
 
         results.append({
             "type": line_type,
-            "shaft": shaft,
-            "arrows": nearby,
+            "shaft": {
+                "path": None,
+                "segments": L["segments"],
+                "length": L["length"],
+                "endpoints": L["terminals"],
+                "rect": None,
+                "num_segments": len(L["segments"]),
+                "path_ids": L["path_ids"],
+            },
+            "arrows": arrows,
+            "crossbars": fold_bars if is_fold else [],
             "score": score,
-            "segments": shaft["segments"],
-            "all_segments": shaft["segments"] +
-                            [s for a in nearby for s in a["segments"]],
+            "segments": L["segments"],
+            "all_segments": L["segments"] + extra,
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -1128,7 +1343,7 @@ def main():
 
     # line params
     parser.add_argument("--min-shaft", type=float, default=35.0)
-    parser.add_argument("--arrow-radius", type=float, default=8.0)
+    parser.add_argument("--arrow-radius", type=float, default=4.0)
     parser.add_argument("--max-arrow-size", type=float, default=35.0)
 
     args = parser.parse_args()
