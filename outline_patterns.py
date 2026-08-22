@@ -1392,3 +1392,31 @@ if __name__ == "__main__":
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
+# Next prompt:
+# I think that potential arrowheads must contain segments that are at an angle to the main shaft.
+# Remember that there are many ways that arrowheads are drawn in different patterns, but of all the segments that make out the arrowhead, at least one segment must have an angle to the main shaft.
+# If it's an 'l', it's easy to calculate the angle, if it's a 'c', just approximate it roughly, no need for very high accuracy here.
+# If 90 degrees is perpendicular, the angle should be between 80 and 10 degrees.
+
+# Am I right to assume that the place where segments are considered as potential arrowhead sites is here?
+# ```
+#         r = path.get("rect")
+#         segs_all = path_to_segments(path)
+#         if r is not None and segs_all:
+#             size = max(r.width, r.height)
+#             nseg = len(segs_all)
+#             thin = 0 < width < min_arrow_width
+#             if size <= max_arrow_size and nseg <= max_arrow_segments and not thin:
+#                 arrow_paths.append({
+#                     "path": path,
+#                     "segments": segs_all,
+#                     "center": ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2),
+#                 })
+#                 arrow_sites.append(((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2))
+#                 for a, b in segs_all:
+#                     arrow_sites.append(a)
+#                     arrow_sites.append(b)
+# ```
+
+# So I assume some additional angle filter should be placed here.
+# And if possible, try to make this arrowhead segment detector be more efficient, maybe less requirements if possible. Not critical if you think they're important.
