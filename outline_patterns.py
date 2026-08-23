@@ -841,22 +841,18 @@ def detect_special_lines(page,
         a = 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
         return math.degrees(math.acos(a))
 
-    def arrow_has_angled_segment(path, shaft_dir, min_deg=10.0, max_deg=80.0):
-        """
-        True if at least one l/c segment on path is angled relative to shaft_dir.
-        """
+    def arrow_has_angled_segment(segments, shaft_dir, min_deg=10.0, max_deg=80.0):
+        """segments is the list of ((x,y),(x,y)) already stored in the arrow record."""
         if shaft_dir == (0.0, 0.0):
             return True
-        for item in path.get("items", []):
-            if item[0] not in ("l", "c"):
-                continue
-            d = seg_dir_from_item(item)
+        for a, b in segments:
+            d = nrm(sub(b, a))
             if d == (0.0, 0.0):
                 continue
             ang = angle_deg_undirected(shaft_dir, d)
             if min_deg <= ang <= max_deg:
                 return True
-        return False    
+        return False
 
     # ------------------------------------------------------------------
     # 1) Straight "l" segments + arrow sites
@@ -1034,7 +1030,7 @@ def detect_special_lines(page,
         for ap in arrow_paths:
             if not arrow_hits_point(ap, point, radius):
                 continue
-            if shaft_dir is not None and not arrow_has_angled_segment(ap["path"], shaft_dir):
+            if shaft_dir is not None and not arrow_has_angled_segment(ap["segments"], shaft_dir):
                 continue
             return True
         return False
@@ -1044,7 +1040,7 @@ def detect_special_lines(page,
         for ap in arrow_paths:
             if not arrow_hits_point(ap, point, radius):
                 continue
-            if shaft_dir is not None and not arrow_has_angled_segment(ap["path"], shaft_dir):
+            if shaft_dir is not None and not arrow_has_angled_segment(ap["segments"], shaft_dir):
                 continue
             out.append(ap)
         return out
