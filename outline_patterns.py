@@ -886,6 +886,7 @@ def detect_special_lines(page,
                 for a, b in segs_all:
                     arrow_sites.append(a)
                     arrow_sites.append(b)
+                continue
 
         for item in items:
             if item[0] != "l":
