@@ -820,6 +820,44 @@ def detect_special_lines(page,
     def dot(u, v):
         return u[0] * v[0] + u[1] * v[1]
 
+    def seg_dir_from_item(item):
+        """Approximate unit direction from a path item ('l' or 'c')."""
+        op = item[0]
+        try:
+            if op == "l":
+                p1, p2 = item[1], item[2]
+                return nrm(sub((p2.x, p2.y), (p1.x, p1.y)))
+            if op == "c":
+                # rough: chord from start to end of cubic
+                p0, p3 = item[1], item[4]
+                return nrm(sub((p3.x, p3.y), (p0.x, p0.y)))
+        except Exception:
+            return (0.0, 0.0)
+        return (0.0, 0.0)
+
+    def angle_deg_undirected(u, v):
+        """Angle between directions in [0, 90]."""
+        a = abs(dot(u, v))
+        a = 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
+        return math.degrees(math.acos(a))
+
+    def arrow_has_angled_segment(path, shaft_dir, min_deg=10.0, max_deg=80.0):
+        """
+        True if at least one l/c segment on path is angled relative to shaft_dir.
+        """
+        if shaft_dir == (0.0, 0.0):
+            return True
+        for item in path.get("items", []):
+            if item[0] not in ("l", "c"):
+                continue
+            d = seg_dir_from_item(item)
+            if d == (0.0, 0.0):
+                continue
+            ang = angle_deg_undirected(shaft_dir, d)
+            if min_deg <= ang <= max_deg:
+                return True
+        return False    
+
     # ------------------------------------------------------------------
     # 1) Straight "l" segments + arrow sites
     # ------------------------------------------------------------------
@@ -983,22 +1021,31 @@ def detect_special_lines(page,
         if min_crossbar_length <= r["length"] <= max_crossbar_length
     ]
 
-    def arrow_near(point, radius):
-        for p in arrow_sites:
-            if dist(p, point) <= radius:
+    def arrow_hits_point(ap, point, radius):
+        if dist(ap["center"], point) <= radius:
+            return True
+        for a, b in ap["segments"]:
+            if dist(a, point) <= radius or dist(b, point) <= radius:
                 return True
         return False
 
-    def arrows_for_render(point, radius):
+    def arrow_near(point, radius, shaft_dir=None):
+        for ap in arrow_paths:
+            if not arrow_hits_point(ap, point, radius):
+                continue
+            if shaft_dir is not None and not arrow_has_angled_segment(ap["path"], shaft_dir):
+                continue
+            return True
+        return False
+
+    def arrows_for_render(point, radius, shaft_dir=None):
         out = []
         for ap in arrow_paths:
-            if dist(ap["center"], point) <= radius:
-                out.append(ap)
+            if not arrow_hits_point(ap, point, radius):
                 continue
-            for a, b in ap["segments"]:
-                if dist(a, point) <= radius or dist(b, point) <= radius:
-                    out.append(ap)
-                    break
+            if shaft_dir is not None and not arrow_has_angled_segment(ap["path"], shaft_dir):
+                continue
+            out.append(ap)
         return out
 
     # ------------------------------------------------------------------
@@ -1019,9 +1066,9 @@ def detect_special_lines(page,
         grain_ends = []
         grain_arrows = []
         for ep in (ep1, ep2):
-            if arrow_near(ep, arrow_search_radius):
+            if arrow_near(ep, arrow_search_radius, shaft_dir=ldir):
                 grain_ends.append(ep)
-                grain_arrows.extend(arrows_for_render(ep, arrow_search_radius))
+                grain_arrows.extend(arrows_for_render(ep, arrow_search_radius, shaft_dir=ldir))
 
         # Fold ends: external short perpendicular runs
         fold_ends = 0
@@ -1049,10 +1096,10 @@ def detect_special_lines(page,
                 else:
                     inner, outer, inner_d = s1, s0, d1
 
-                if not arrow_near(outer, arrow_search_radius):
+                if not arrow_near(outer, arrow_search_radius, shaft_dir=ldir):
                     continue
 
-                arr = arrows_for_render(outer, arrow_search_radius)
+                arr = arrows_for_render(outer, arrow_search_radius, shaft_dir=ldir)
                 if best is None or inner_d < best[0]:
                     best = (inner_d, S, outer, arr)
 
@@ -1082,10 +1129,11 @@ def detect_special_lines(page,
                     outer = s["b"] if d0 <= d1 else s["a"]
                     if dist(outer, ep) < min_crossbar_length * 0.5:
                         continue
-                    if arrow_near(outer, arrow_search_radius):
+                    if arrow_near(outer, arrow_search_radius, shaft_dir=ldir):
                         own_short_perp += 1
-                        own_arrows.extend(arrows_for_render(outer, arrow_search_radius))
-                        break
+                        own_arrows.extend(
+                            arrows_for_render(outer, arrow_search_radius, shaft_dir=ldir)
+                        )
             if own_short_perp >= min_fold_ends:
                 is_fold = True
                 fold_arrows = own_arrows
@@ -1392,31 +1440,3 @@ if __name__ == "__main__":
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
-# Next prompt:
-# I think that potential arrowheads must contain segments that are at an angle to the main shaft.
-# Remember that there are many ways that arrowheads are drawn in different patterns, but of all the segments that make out the arrowhead, at least one segment must have an angle to the main shaft.
-# If it's an 'l', it's easy to calculate the angle, if it's a 'c', just approximate it roughly, no need for very high accuracy here.
-# If 90 degrees is perpendicular, the angle should be between 80 and 10 degrees.
-
-# Am I right to assume that the place where segments are considered as potential arrowhead sites is here?
-# ```
-#         r = path.get("rect")
-#         segs_all = path_to_segments(path)
-#         if r is not None and segs_all:
-#             size = max(r.width, r.height)
-#             nseg = len(segs_all)
-#             thin = 0 < width < min_arrow_width
-#             if size <= max_arrow_size and nseg <= max_arrow_segments and not thin:
-#                 arrow_paths.append({
-#                     "path": path,
-#                     "segments": segs_all,
-#                     "center": ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2),
-#                 })
-#                 arrow_sites.append(((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2))
-#                 for a, b in segs_all:
-#                     arrow_sites.append(a)
-#                     arrow_sites.append(b)
-# ```
-
-# So I assume some additional angle filter should be placed here.
-# And if possible, try to make this arrowhead segment detector be more efficient, maybe less requirements if possible. Not critical if you think they're important.
