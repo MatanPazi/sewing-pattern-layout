@@ -1388,7 +1388,7 @@ def main():
 
     # line params
     parser.add_argument("--min-shaft", type=float, default=35.0)
-    parser.add_argument("--arrow-radius", type=float, default=4.0)
+    parser.add_argument("--arrow-radius", type=float, default=12.0)
     parser.add_argument("--max-arrow-size", type=float, default=35.0)
 
     args = parser.parse_args()
