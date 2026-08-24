@@ -1437,3 +1437,23 @@ if __name__ == "__main__":
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
+
+# Consider:
+
+# Right now everything is categorized in one pass with incomplete context.
+# for each path:
+#   if small → mark as arrow (and with continue: skip as geometry)
+#   else → maybe shaft segment
+
+# Better order (shaft-first)text
+
+# 1. Collect ALL straight "l" geometry as segments/runs
+#    (no path is excluded because it “might be an arrow”)
+
+# 2. Identify long runs  → potential shafts
+# 3. Identify short runs → potential crossbars / junk
+
+# 4. Only then resolve arrowheads relative to a concrete shaft:
+#      near this end + angled 10°–80° to THIS shaft
+
+
