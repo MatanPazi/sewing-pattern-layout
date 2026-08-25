@@ -1155,13 +1155,15 @@ def detect_special_lines(page,
             score = len(grain_ends) * 10 + len(arrows)
             used_seg_idxs.update(L["seg_idxs"])
 
-        for ap in arrows:
-            for i, s in enumerate(segments):
-                if i in used_seg_idxs:
-                    continue
-                if (arrow_hits_point(ap, s["a"], arrow_search_radius) or
-                    arrow_hits_point(ap, s["b"], arrow_search_radius)):
-                    used_seg_idxs.add(i)
+        # Consume only the geometry that belongs to the arrows we just used.
+        # This prevents arrow edges from becoming false short shafts later,
+        # while leaving nearby fold brackets / other shafts completely free.
+        used_arrow_path_ids = {ap["path_id"] for ap in arrows}
+        for i, s in enumerate(segments):
+            if i in used_seg_idxs:
+                continue
+            if s["path_id"] in used_arrow_path_ids:
+                used_seg_idxs.add(i)
 
         # de-dup arrows
         uniq = {}
