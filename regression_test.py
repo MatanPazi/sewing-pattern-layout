@@ -118,22 +118,12 @@ def run_case(golden_txt: Path, tmp_dir: Path) -> tuple[bool, str]:
     if mode == "patterns":
         pieces = detect_patterns(
             page_obj,
-            gap_threshold=float(meta.get("gap", 10.0)),
-            point_tol=float(meta.get("point_tol", 1.0)),
-            min_perimeter=float(meta.get("min_perimeter", 250.0)),
-            min_polygon_area=float(meta.get("min_area", 8000.0)),
-            min_option_length=float(meta.get("min_option_length", 60.0)),
-            attach_tol=float(meta.get("attach_tol", 12.0)),
         )
         write_patterns_txt(pieces, out_txt)
         errors = compare_patterns(parse_patterns_txt(out_txt), parse_patterns_txt(golden_txt))
     else:
         lines = detect_special_lines(
             page_obj,
-            min_shaft_length=float(meta.get("min_shaft", 35.0)),
-            arrow_search_radius=float(meta.get("arrow_radius", 8.0)),
-            max_arrow_size=float(meta.get("max_arrow_size", 35.0)),
-            point_tol=float(meta.get("point_tol", 1.0)),
         )
         write_lines_txt(lines, out_txt)
         errors = compare_lines(parse_lines_txt(out_txt), parse_lines_txt(golden_txt))
