@@ -1487,3 +1487,19 @@ if __name__ == "__main__":
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
 
+# Don't care about style, since some length options are different style or same style as the main piece
+# However, make sure the length option path spans most of the main pattern piece.
+# That will help avoid darts as options.
+# Look at this part, change it to avoid "same_style" but use the idea of "should span a good fraction of the piece", not sure about the chord reference:
+            # if same_style:
+            #     # Same-style → only accept clear length/width option marks
+            #     # (long, axis-aligned chords). Ignore darts, notches, etc.
+            #     if not is_mostly_axis_aligned(segs):
+            #         continue
+            #     # Optional extra safety: the chord should span a good fraction of the piece
+            #     # (uncomment if you still get false positives)
+            #     # main_w = m["bbox"][2] - m["bbox"][0]
+            #     # main_h = m["bbox"][3] - m["bbox"][1]
+            #     # if extent < 0.25 * max(main_w, main_h):
+            #     #     continue
+            # # else: alternate style is already accepted once it attaches + is long enough
