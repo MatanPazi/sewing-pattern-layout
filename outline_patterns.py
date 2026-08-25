@@ -141,6 +141,66 @@ def detect_patterns(page,
 
     drawings = page.get_drawings()
 
+    def point_to_segment_dist(p, a, b):
+        ax, ay = a
+        bx, by = b
+        px, py = p
+        dx, dy = bx - ax, by - ay
+        len_sq = dx*dx + dy*dy
+        if len_sq < 1e-12:
+            return math.hypot(px-ax, py-ay)
+        t = max(0.0, min(1.0, ((px-ax)*dx + (py-ay)*dy) / len_sq))
+        projx = ax + t*dx
+        projy = ay + t*dy
+        return math.hypot(px-projx, py-projy)
+
+    def point_to_polyline_dist(p, segs):
+        if not segs:
+            return float("inf")
+        return min(point_to_segment_dist(p, a, b) for a, b in segs)
+
+    def attaches(chain_segs, main_segs, tol=None):
+        if tol is None:
+            tol = attach_tol
+        if not chain_segs or not main_segs:
+            return False
+        # both endpoints of every segment in the candidate (handles multi-seg options)
+        ends = []
+        for a, b in chain_segs:
+            ends.append(a)
+            ends.append(b)
+        # dedup
+        seen = set()
+        uniq = []
+        for e in ends:
+            key = (round(e[0], 2), round(e[1], 2))
+            if key not in seen:
+                seen.add(key)
+                uniq.append(e)
+        for e in uniq:
+            if point_to_polyline_dist(e, main_segs) <= tol:
+                return True
+        return False
+
+    def is_mostly_axis_aligned(segs, max_angle_dev_deg=15.0):
+        """True if the chain is predominantly horizontal or vertical."""
+        if not segs:
+            return False
+        total_len = 0.0
+        axis_len = 0.0
+        for a, b in segs:
+            dx = b[0] - a[0]
+            dy = b[1] - a[1]
+            ln = math.hypot(dx, dy)
+            if ln < 1e-6:
+                continue
+            total_len += ln
+            ang = abs(math.degrees(math.atan2(dy, dx))) % 180.0
+            # near 0° or 90°
+            if min(ang, 180 - ang, abs(ang - 90)) <= max_angle_dev_deg:
+                axis_len += ln
+        return total_len > 0 and axis_len / total_len >= 0.85
+
     def quant(p):
         return (round(p[0] / point_tol), round(p[1] / point_tol))
 
@@ -542,21 +602,6 @@ def detect_patterns(page,
     # 5) Attach length options
     #    Options must be endpoint-connected chains (not style bags).
     # ------------------------------------------------------------------
-    def attaches(chain_segs, main_segs):
-        if not chain_segs or not main_segs:
-            return False
-        ends = [chain_segs[0][0], chain_segs[0][1],
-                chain_segs[-1][0], chain_segs[-1][1]]
-        step = max(1, len(main_segs) // 100)
-        sample = []
-        for a, b in main_segs[::step]:
-            sample.append(a)
-            sample.append(b)
-        for e in ends:
-            for p in sample:
-                if dist(e, p) <= attach_tol:
-                    return True
-        return False
 
     def inside_bbox(segs, bbox, pad=30.0):
         x0, y0, x1, y1 = bbox
@@ -693,17 +738,29 @@ def detect_patterns(page,
             style = (comp[0]["color"], comp[0]["width"])
             extent = chain_extent(segs)
 
-            # Same style as outline → ignore (no darts)
-            if style == main_style:
-                continue
-
-            # Alternate style → length option only if connected + long enough
             if length < min_option_length:
                 continue
             if extent < min_option_length * 0.5:
                 continue
+
+            # Must touch the main outline
             if not attaches(segs, m["segments"]):
                 continue
+
+            same_style = (style == main_style)
+
+            if same_style:
+                # Same-style → only accept clear length/width option marks
+                # (long, axis-aligned chords). Ignore darts, notches, etc.
+                if not is_mostly_axis_aligned(segs):
+                    continue
+                # Optional extra safety: the chord should span a good fraction of the piece
+                # (uncomment if you still get false positives)
+                # main_w = m["bbox"][2] - m["bbox"][0]
+                # main_h = m["bbox"][3] - m["bbox"][1]
+                # if extent < 0.25 * max(main_w, main_h):
+                #     continue
+            # else: alternate style is already accepted once it attaches + is long enough
 
             variants.append({
                 "segments": segs,
