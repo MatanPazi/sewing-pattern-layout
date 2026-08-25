@@ -781,7 +781,7 @@ def detect_special_lines(page,
                          max_arrow_segments=30,
                          min_arrow_width=0.7,
                          point_tol=1.0,
-                         min_crossbar_length=8.0,
+                         min_crossbar_length=4.0,
                          max_crossbar_length=90.0,
                          join_gap=8.0,
                          collinear_dot_min=0.98,
@@ -1155,6 +1155,14 @@ def detect_special_lines(page,
             score = len(grain_ends) * 10 + len(arrows)
             used_seg_idxs.update(L["seg_idxs"])
 
+        for ap in arrows:
+            for i, s in enumerate(segments):
+                if i in used_seg_idxs:
+                    continue
+                if (arrow_hits_point(ap, s["a"], arrow_search_radius) or
+                    arrow_hits_point(ap, s["b"], arrow_search_radius)):
+                    used_seg_idxs.add(i)
+
         # de-dup arrows
         uniq = {}
         for a in arrows:
@@ -1390,7 +1398,7 @@ def main():
     parser.add_argument("--min-option-length", type=float, default=80.0)
 
     # line params
-    parser.add_argument("--min-shaft", type=float, default=35.0)
+    parser.add_argument("--min-shaft", type=float, default=20.0)
     parser.add_argument("--arrow-radius", type=float, default=12.0)
     parser.add_argument("--max-arrow-size", type=float, default=35.0)
 
@@ -1440,23 +1448,4 @@ if __name__ == "__main__":
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
-
-# Consider:
-
-# Right now everything is categorized in one pass with incomplete context.
-# for each path:
-#   if small → mark as arrow (and with continue: skip as geometry)
-#   else → maybe shaft segment
-
-# Better order (shaft-first)text
-
-# 1. Collect ALL straight "l" geometry as segments/runs
-#    (no path is excluded because it “might be an arrow”)
-
-# 2. Identify long runs  → potential shafts
-# 3. Identify short runs → potential crossbars / junk
-
-# 4. Only then resolve arrowheads relative to a concrete shaft:
-#      near this end + angled 10°–80° to THIS shaft
-
 
