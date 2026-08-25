@@ -794,8 +794,9 @@ def detect_special_lines(page,
     Fold:  long run with short perpendicular run(s) at end(s)
            and arrow(s) near the outer end of those short runs.
 
-    Crossbars used by a fold are consumed so they are not also
-    reported as grain lines.
+    Shaft-first: all straight geometry is collected first; arrows are
+    resolved only relative to concrete shafts. Short fold brackets are
+    never excluded early.
     """
     from collections import defaultdict
     import math
@@ -828,7 +829,6 @@ def detect_special_lines(page,
                 p1, p2 = item[1], item[2]
                 return nrm(sub((p2.x, p2.y), (p1.x, p1.y)))
             if op == "c":
-                # rough: chord from start to end of cubic
                 p0, p3 = item[1], item[4]
                 return nrm(sub((p3.x, p3.y), (p0.x, p0.y)))
         except Exception:
@@ -842,7 +842,7 @@ def detect_special_lines(page,
         return math.degrees(math.acos(a))
 
     def arrow_has_angled_segment(segments, shaft_dir, min_deg=10.0, max_deg=80.0):
-        """segments is the list of ((x,y),(x,y)) already stored in the arrow record."""
+        """True if at least one segment is angled relative to shaft_dir."""
         if shaft_dir == (0.0, 0.0):
             return True
         for a, b in segments:
@@ -855,10 +855,10 @@ def detect_special_lines(page,
         return False
 
     # ------------------------------------------------------------------
-    # 1) Straight "l" segments + arrow sites
+    # 1) Collect ALL straight "l" segments + arrow candidates
+    #    (no path is excluded from geometry)
     # ------------------------------------------------------------------
     segments = []
-    arrow_sites = []
     arrow_paths = []
 
     for path_idx, path in enumerate(drawings):
@@ -868,6 +868,8 @@ def detect_special_lines(page,
 
         r = path.get("rect")
         segs_all = path_to_segments(path)
+
+        # Record arrow candidates (geometry is still extracted below)
         if r is not None and segs_all:
             size = max(r.width, r.height)
             nseg = len(segs_all)
@@ -877,13 +879,10 @@ def detect_special_lines(page,
                     "path": path,
                     "segments": segs_all,
                     "center": ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2),
+                    "path_id": path_idx,
                 })
-                arrow_sites.append(((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2))
-                for a, b in segs_all:
-                    arrow_sites.append(a)
-                    arrow_sites.append(b)
-                continue
 
+        # Always collect straight segments
         for item in items:
             if item[0] != "l":
                 continue
@@ -1011,7 +1010,7 @@ def detect_special_lines(page,
         })
 
     long_runs = [r for r in runs if r["max_l"] >= min_shaft_length]
-    long_runs.sort(key=lambda r: r["max_l"], reverse=True) # longest first
+    long_runs.sort(key=lambda r: r["max_l"], reverse=True)
 
     short_runs = [
         r for r in runs
@@ -1052,14 +1051,13 @@ def detect_special_lines(page,
     used_seg_idxs = set()
 
     for L in long_runs:
-        # skip if this run was already used as a fold crossbar / shaft
         if set(L["seg_idxs"]) & used_seg_idxs:
             continue
 
         ep1, ep2 = L["terminals"]
         ldir = L["direction"]
 
-        # Grain ends
+        # Grain ends: arrow near the shaft terminal itself
         grain_ends = []
         grain_arrows = []
         for ep in (ep1, ep2):
@@ -1078,6 +1076,9 @@ def detect_special_lines(page,
                 if set(S["seg_idxs"]) & set(L["seg_idxs"]):
                     continue
                 if set(S["seg_idxs"]) & used_seg_idxs:
+                    continue
+                # real fold brackets match shaft stroke; arrow edges do not
+                if S["width"] != L["width"]:
                     continue
                 if abs(dot(ldir, S["direction"])) > perp_dot_max:
                     continue
@@ -1117,6 +1118,8 @@ def detect_special_lines(page,
                     s = segments[si]
                     if s["length"] < min_crossbar_length or s["length"] > max_crossbar_length:
                         continue
+                    if s["width"] != L["width"]:
+                        continue
                     if abs(dot(ldir, s["dir"])) > perp_dot_max:
                         continue
                     d0 = dist(s["a"], ep)
@@ -1138,11 +1141,11 @@ def detect_special_lines(page,
         if not is_fold and not is_grain:
             continue
 
+        # Prefer fold when both could match (brackets + arrows near shaft ends)
         if is_fold:
             line_type = "fold"
             arrows = fold_arrows
             score = 100 + fold_ends * 10 + len(arrows)
-            # consume shaft + crossbars so crossbars are not reported as grain
             used_seg_idxs.update(L["seg_idxs"])
             for b in fold_bars:
                 used_seg_idxs.update(b["seg_idxs"])
