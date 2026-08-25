@@ -121,7 +121,7 @@ class UnionFind:
 # PATTERN detection
 # ------------------------------------------------------------------
 def detect_patterns(page,
-                    gap_threshold=10.0,
+                    gap_threshold=20.0,
                     point_tol=1.0,
                     min_perimeter=250.0,
                     min_polygon_area=8000.0,
