@@ -775,7 +775,7 @@ def _dedupe_cycles(cycles):
 
 
 def detect_special_lines(page,
-                         min_shaft_length=35.0,
+                         min_shaft_length=20.0,
                          arrow_search_radius=12.0,
                          max_arrow_size=35.0,
                          max_arrow_segments=30,
@@ -1391,18 +1391,6 @@ def main():
     parser.add_argument("--mode", choices=["patterns", "lines", "both"], default="both")
     parser.add_argument("--page", type=int, default=0)
     parser.add_argument("--out-dir", type=Path, default=None)
-
-    # pattern params
-    parser.add_argument("--gap", type=float, default=10.0)
-    parser.add_argument("--point-tol", type=float, default=1.0)
-    parser.add_argument("--min-perimeter", type=float, default=250.0)
-    parser.add_argument("--min-area", type=float, default=8000.0)
-    parser.add_argument("--min-option-length", type=float, default=80.0)
-
-    # line params
-    parser.add_argument("--min-shaft", type=float, default=20.0)
-    parser.add_argument("--arrow-radius", type=float, default=12.0)
-    parser.add_argument("--max-arrow-size", type=float, default=35.0)
 
     args = parser.parse_args()
 
