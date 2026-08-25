@@ -1404,11 +1404,6 @@ def main():
     if args.mode in ("patterns", "both"):
         pieces = detect_patterns(
             page,
-            gap_threshold=args.gap,
-            point_tol=args.point_tol,
-            min_perimeter=args.min_perimeter,
-            min_polygon_area=args.min_area,
-            min_option_length=args.min_option_length,
         )
         print(f"Found {len(pieces)} pattern piece(s)")
         write_patterns_txt(pieces, out_dir / f"{stem}_patterns.txt")
@@ -1417,10 +1412,6 @@ def main():
     if args.mode in ("lines", "both"):
         lines = detect_special_lines(
             page,
-            min_shaft_length=args.min_shaft,
-            arrow_search_radius=args.arrow_radius,
-            max_arrow_size=args.max_arrow_size,
-            point_tol=args.point_tol,
         )
         print(f"Found {len(lines)} special line(s)")
         for i, obj in enumerate(lines):
