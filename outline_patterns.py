@@ -949,11 +949,7 @@ def detect_patterns(page,
                 continue
 
             chord = attachment_chord(segs, m["segments"])
-            if length > 1.8 * chord:               # dart filter
-                print(f"pids={pids}  length={length:.2f}  "
-                    f"geom_chord={dist(p0,p1) if p0 else 0:.2f}  "
-                    f"attach_chord={attachment_chord(segs, m['segments']):.2f}  "
-                    f"ratio={length / max(chord, 1e-6):.3f}")                                
+            if length > 1.8 * chord:               # dart filter                              
                 continue
 
             # main_w = m["bbox"][2] - m["bbox"][0]
