@@ -141,26 +141,141 @@ def detect_patterns(page,
 
     drawings = page.get_drawings()
 
-    def endpoint_chord(segs):
-        """Euclidean distance between the two extreme endpoints of the chain."""
+    def path_extent(p):
+        """Axis-aligned extent (max of width/height) of a single path."""
+        xs = [p["t0"][0], p["t1"][0]]
+        ys = [p["t0"][1], p["t1"][1]]
+        for a, b in p["segments"]:
+            xs.extend([a[0], b[0]])
+            ys.extend([a[1], b[1]])
+        return max(max(xs) - min(xs), max(ys) - min(ys))
+
+    def combined_extent(p1, p2):
+        """Extent of the union of two paths."""
+        xs, ys = [], []
+        for p in (p1, p2):
+            xs.extend([p["t0"][0], p["t1"][0]])
+            ys.extend([p["t0"][1], p["t1"][1]])
+            for a, b in p["segments"]:
+                xs.extend([a[0], b[0]])
+                ys.extend([a[1], b[1]])
+        return max(max(xs) - min(xs), max(ys) - min(ys))
+
+    def should_join(p1, p2, gap):
+        """
+        Return True only if joining p1 and p2 looks like a real continuation
+        (dashed line, colinear extension) rather than near-duplicate / parallel overlap.
+        """
+        # Quick reject if extents are almost identical and large
+        e1 = path_extent(p1)
+        e2 = path_extent(p2)
+        e_comb = combined_extent(p1, p2)
+
+        # The combined shape must be noticeably longer than each individual piece
+        if e_comb < 1.25 * max(e1, e2):
+            return False
+
+        # Optional stricter check: the added length should be plausible
+        # (prevents weird side-by-side joins)
+        if e_comb < 0.85 * (e1 + e2):
+            return False
+
+        return True
+
+    def ordered_chain_endpoints(segs):
+        """
+        Return the two terminal points of a chain of segments.
+        Handles reversed segments and unordered input reasonably well.
+        """
         if not segs:
-            return 0.0
-        # Collect all points, but the true terminals are enough for simple lines
-        starts_ends = [segs[0][0], segs[0][1], segs[-1][0], segs[-1][1]]
-        # More robust: take the two points that are farthest apart
-        pts = []
+            return None, None
+
+        # Build a simple adjacency of points (rounded to avoid float noise)
+        from collections import defaultdict
+        def key(p):
+            return (round(p[0], 3), round(p[1], 3))
+
+        adj = defaultdict(list)
+        points = {}
         for a, b in segs:
-            pts.append(a)
-            pts.append(b)
-        if len(pts) < 2:
-            return 0.0
-        max_d = 0.0
+            ka, kb = key(a), key(b)
+            points[ka] = a
+            points[kb] = b
+            adj[ka].append(kb)
+            adj[kb].append(ka)
+
+        # Terminals = points with degree 1 (or the two farthest if the graph is messy)
+        deg1 = [k for k, nbrs in adj.items() if len(set(nbrs)) == 1]
+        if len(deg1) >= 2:
+            # pick the pair of degree-1 points that are farthest apart
+            best = 0.0
+            t0 = t1 = None
+            for i in range(len(deg1)):
+                for j in range(i+1, len(deg1)):
+                    d = dist(points[deg1[i]], points[deg1[j]])
+                    if d > best:
+                        best = d
+                        t0, t1 = points[deg1[i]], points[deg1[j]]
+            return t0, t1
+
+        # Fallback: just the farthest pair of any points
+        pts = list(points.values())
+        best = 0.0
+        t0 = t1 = pts[0]
         for i in range(len(pts)):
             for j in range(i+1, len(pts)):
                 d = dist(pts[i], pts[j])
-                if d > max_d:
-                    max_d = d
-        return max_d
+                if d > best:
+                    best = d
+                    t0, t1 = pts[i], pts[j]
+        return t0, t1
+
+
+    def attachment_chord(segs, main_segs, tol=None):
+        """
+        Distance between the two points of the candidate that lie closest
+        to the main outline (i.e. the true attachment points).
+        Falls back to geometric endpoints if needed.
+        """
+        if tol is None:
+            tol = attach_tol * 1.5
+
+        # Collect candidate points (all vertices)
+        cand_pts = []
+        for a, b in segs:
+            cand_pts.append(a)
+            cand_pts.append(b)
+        # dedup
+        seen = set()
+        uniq = []
+        for p in cand_pts:
+            k = (round(p[0], 3), round(p[1], 3))
+            if k not in seen:
+                seen.add(k)
+                uniq.append(p)
+
+        # Points that are close to the main outline
+        attached = [p for p in uniq if point_to_polyline_dist(p, main_segs) <= tol]
+
+        if len(attached) >= 2:
+            # farthest pair among the attached points
+            best = 0.0
+            for i in range(len(attached)):
+                for j in range(i+1, len(attached)):
+                    d = dist(attached[i], attached[j])
+                    if d > best:
+                        best = d
+            return best
+
+        # Fallback: geometric endpoints of the chain
+        p0, p1 = ordered_chain_endpoints(segs)
+        # print(f"pids={pids}  length={length:.2f}  "
+        #     f"geom_chord={dist(p0,p1) if p0 else 0:.2f}  "
+        #     f"attach_chord={attachment_chord(segs, m['segments']):.2f}  "
+        #     f"ratio={length / max(chord, 1e-6):.3f}")                
+        if p0 is None:
+            return 0.0
+        return dist(p0, p1)
 
     def point_to_segment_dist(p, a, b):
         ax, ay = a
@@ -706,8 +821,12 @@ def detect_patterns(page,
                         j, xy2 = terms[tj]
                         if i == j:
                             continue
-                        if dist(xy, xy2) <= gap:
-                            union(i, j)
+                        if dist(xy, xy2) > gap:
+                            continue
+                        # only join if it actually extends the geometry
+                        if not should_join(path_recs[i], path_recs[j], gap):
+                            continue                        
+                        union(i, j)
 
             groups = defaultdict(list)
             for i in idxs:
@@ -768,16 +887,20 @@ def detect_patterns(page,
             if not attaches(segs, m["segments"]):
                 continue
 
-            chord = endpoint_chord(segs)
-            if length > 1.7 * chord:               # dart filter
+            chord = attachment_chord(segs, m["segments"])
+            if length > 1.3 * chord:               # dart filter
+                print(f"pids={pids}  length={length:.2f}  "
+                    f"geom_chord={dist(p0,p1) if p0 else 0:.2f}  "
+                    f"attach_chord={attachment_chord(segs, m['segments']):.2f}  "
+                    f"ratio={length / max(chord, 1e-6):.3f}")                                
                 continue
 
-            main_w = m["bbox"][2] - m["bbox"][0]
-            main_h = m["bbox"][3] - m["bbox"][1]
+            # main_w = m["bbox"][2] - m["bbox"][0]
+            # main_h = m["bbox"][3] - m["bbox"][1]
             
-            # Reject tiny base even if the ratio is ok (very small darts / notches)
-            if chord < 0.08 * max(main_w, main_h):   # or 0.12 * min(...)
-                continue
+            # # Reject tiny base even if the ratio is ok (very small darts / notches)
+            # if chord < 0.08 * max(main_w, main_h):   # or 0.12 * min(...)
+            #     continue
 
             variants.append({
                 "segments": segs,
