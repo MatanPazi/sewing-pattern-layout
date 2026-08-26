@@ -141,6 +141,45 @@ def detect_patterns(page,
 
     drawings = page.get_drawings()
 
+    def variant_key(v, tol=8.0):
+        """
+        Produce a quantization key so that near-identical lines fall into the same bucket.
+        Uses the midpoint and the dominant orientation.
+        """
+        segs = v["segments"]
+        if not segs:
+            return None
+        # midpoint
+        pts = [p for s in segs for p in s]
+        mx = sum(p[0] for p in pts) / len(pts)
+        my = sum(p[1] for p in pts) / len(pts)
+        # rough direction
+        p0, p1 = segs[0][0], segs[-1][1]
+        dx, dy = abs(p1[0] - p0[0]), abs(p1[1] - p0[1])
+        horizontal = dx >= dy
+        # quantize
+        qx = round(mx / tol)
+        qy = round(my / tol)
+        return (horizontal, qx, qy)
+
+    def deduplicate_variants(variants, tol=8.0):
+        """
+        Keep only one variant per location.
+        Preference: longer one, then the one with more path_ids (or any stable rule).
+        """
+        groups = {}
+        for v in variants:
+            key = variant_key(v, tol=tol)
+            if key is None:
+                continue
+            if key not in groups:
+                groups[key] = v
+            else:
+                # keep the longer one (or the first, or the one with smaller path id…)
+                if v["length"] > groups[key]["length"]:
+                    groups[key] = v
+        return list(groups.values())
+
     def path_extent(p):
         """Axis-aligned extent (max of width/height) of a single path."""
         xs = [p["t0"][0], p["t1"][0]]
@@ -911,6 +950,7 @@ def detect_patterns(page,
             })
             used_path_ids.update(pids)
 
+        variants = deduplicate_variants(variants, tol=8.0)   # 5–15 works well
         variants.sort(key=lambda v: v["length"], reverse=True)
 
         pieces.append({
