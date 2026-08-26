@@ -141,6 +141,27 @@ def detect_patterns(page,
 
     drawings = page.get_drawings()
 
+    def endpoint_chord(segs):
+        """Euclidean distance between the two extreme endpoints of the chain."""
+        if not segs:
+            return 0.0
+        # Collect all points, but the true terminals are enough for simple lines
+        starts_ends = [segs[0][0], segs[0][1], segs[-1][0], segs[-1][1]]
+        # More robust: take the two points that are farthest apart
+        pts = []
+        for a, b in segs:
+            pts.append(a)
+            pts.append(b)
+        if len(pts) < 2:
+            return 0.0
+        max_d = 0.0
+        for i in range(len(pts)):
+            for j in range(i+1, len(pts)):
+                d = dist(pts[i], pts[j])
+                if d > max_d:
+                    max_d = d
+        return max_d
+
     def point_to_segment_dist(p, a, b):
         ax, ay = a
         bx, by = b
@@ -747,20 +768,16 @@ def detect_patterns(page,
             if not attaches(segs, m["segments"]):
                 continue
 
-            same_style = (style == main_style)
+            chord = endpoint_chord(segs)
+            if length > 1.7 * chord:               # dart filter
+                continue
 
-            if same_style:
-                # Same-style → only accept clear length/width option marks
-                # (long, axis-aligned chords). Ignore darts, notches, etc.
-                if not is_mostly_axis_aligned(segs):
-                    continue
-                # Optional extra safety: the chord should span a good fraction of the piece
-                # (uncomment if you still get false positives)
-                # main_w = m["bbox"][2] - m["bbox"][0]
-                # main_h = m["bbox"][3] - m["bbox"][1]
-                # if extent < 0.25 * max(main_w, main_h):
-                #     continue
-            # else: alternate style is already accepted once it attaches + is long enough
+            main_w = m["bbox"][2] - m["bbox"][0]
+            main_h = m["bbox"][3] - m["bbox"][1]
+            
+            # Reject tiny base even if the ratio is ok (very small darts / notches)
+            if chord < 0.08 * max(main_w, main_h):   # or 0.12 * min(...)
+                continue
 
             variants.append({
                 "segments": segs,
@@ -1487,19 +1504,4 @@ if __name__ == "__main__":
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
 
-# Don't care about style, since some length options are different style or same style as the main piece
-# However, make sure the length option path spans most of the main pattern piece.
-# That will help avoid darts as options.
-# Look at this part, change it to avoid "same_style" but use the idea of "should span a good fraction of the piece", not sure about the chord reference:
-            # if same_style:
-            #     # Same-style → only accept clear length/width option marks
-            #     # (long, axis-aligned chords). Ignore darts, notches, etc.
-            #     if not is_mostly_axis_aligned(segs):
-            #         continue
-            #     # Optional extra safety: the chord should span a good fraction of the piece
-            #     # (uncomment if you still get false positives)
-            #     # main_w = m["bbox"][2] - m["bbox"][0]
-            #     # main_h = m["bbox"][3] - m["bbox"][1]
-            #     # if extent < 0.25 * max(main_w, main_h):
-            #     #     continue
-            # # else: alternate style is already accepted once it attaches + is long enough
+# Handle dart rejection, WIP
