@@ -180,46 +180,68 @@ def detect_patterns(page,
                     groups[key] = v
         return list(groups.values())
 
-    def path_extent(p):
-        """Axis-aligned extent (max of width/height) of a single path."""
-        xs = [p["t0"][0], p["t1"][0]]
-        ys = [p["t0"][1], p["t1"][1]]
-        for a, b in p["segments"]:
-            xs.extend([a[0], b[0]])
-            ys.extend([a[1], b[1]])
-        return max(max(xs) - min(xs), max(ys) - min(ys))
+    def segment_direction(p):
+        """Return normalized direction vector of a path (from t0 to t1)."""
+        dx = p["t1"][0] - p["t0"][0]
+        dy = p["t1"][1] - p["t0"][1]
+        length = math.hypot(dx, dy)
+        if length < 1e-8:
+            return (0.0, 0.0), 0.0
+        return (dx / length, dy / length), length
 
-    def combined_extent(p1, p2):
-        """Extent of the union of two paths."""
-        xs, ys = [], []
-        for p in (p1, p2):
-            xs.extend([p["t0"][0], p["t1"][0]])
-            ys.extend([p["t0"][1], p["t1"][1]])
-            for a, b in p["segments"]:
-                xs.extend([a[0], b[0]])
-                ys.extend([a[1], b[1]])
-        return max(max(xs) - min(xs), max(ys) - min(ys))
+    def angle_between(v1, v2):
+        """Smallest angle in degrees between two normalized vectors."""
+        dot = max(-1.0, min(1.0, v1[0]*v2[0] + v1[1]*v2[1]))
+        return math.degrees(math.acos(dot))
 
-    def should_join(p1, p2, gap):
+    def max_endpoint_distance(p1, p2):
+        """Largest distance among the four endpoints."""
+        pts = [p1["t0"], p1["t1"], p2["t0"], p2["t1"]]
+        best = 0.0
+        for i in range(4):
+            for j in range(i+1, 4):
+                d = dist(pts[i], pts[j])
+                if d > best:
+                    best = d
+        return best
+
+    def should_join(p1, p2, gap, parallel_angle_tol=5.0, span_eps=0.08):
         """
-        Return True only if joining p1 and p2 looks like a real continuation
-        (dashed line, colinear extension) rather than near-duplicate / parallel overlap.
+        Decide whether two nearby paths should be merged into one component.
+        
+        - If they form a noticeable angle → allow join (polyline corner / continuation).
+        - If nearly parallel → only join when the combined span is clearly larger
+        than the longer individual segment (i.e. they extend each other,
+        not sit on top of one another).
         """
-        # Quick reject if extents are almost identical and large
-        e1 = path_extent(p1)
-        e2 = path_extent(p2)
-        e_comb = combined_extent(p1, p2)
+        (d1, len1) = segment_direction(p1)
+        (d2, len2) = segment_direction(p2)
 
-        # The combined shape must be noticeably longer than each individual piece
-        if e_comb < 1.25 * max(e1, e2):
+        if len1 < 1e-6 or len2 < 1e-6:
             return False
 
-        # Optional stricter check: the added length should be plausible
-        # (prevents weird side-by-side joins)
-        if e_comb < 0.85 * (e1 + e2):
-            return False
+        ang = angle_between(d1, d2)
+        ang = min(ang, 180.0 - ang)          # smallest angle
 
-        return True
+        if ang > parallel_angle_tol:
+            # Clearly not parallel – treat as normal continuation / corner
+            return True
+
+        # Nearly parallel: check whether the overall span grows
+        combined_span = max_endpoint_distance(p1, p2)
+        longer = max(len1, len2)
+
+        # Allow join only if the farthest endpoints are meaningfully farther
+        # apart than the longer segment alone
+        if combined_span > longer * (1.0 + span_eps):
+            return True
+
+        # Special case: very short segment attaching to a long one
+        # (common in dashed lines). Require at least a small absolute growth.
+        if combined_span > longer + max(gap * 0.7, 3.0):
+            return True
+
+        return False
 
     def ordered_chain_endpoints(segs):
         """
@@ -927,7 +949,7 @@ def detect_patterns(page,
                 continue
 
             chord = attachment_chord(segs, m["segments"])
-            if length > 1.3 * chord:               # dart filter
+            if length > 1.8 * chord:               # dart filter
                 print(f"pids={pids}  length={length:.2f}  "
                     f"geom_chord={dist(p0,p1) if p0 else 0:.2f}  "
                     f"attach_chord={attachment_chord(segs, m['segments']):.2f}  "
