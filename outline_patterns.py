@@ -340,19 +340,6 @@ def assemble_pages(pattern_doc, pattern_pages,
         )
 
     print(f"Final canvas: {global_rect.width:.1f} × {global_rect.height:.1f}")
-    print("\n=== Path statistics after assembly ===")
-    total_l = 0
-    small_paths = 0
-    for p in global_paths:
-        items = p.get("items", [])
-        l_count = sum(1 for it in items if it[0] == "l")
-        total_l += l_count
-        r = p.get("rect")
-        if r and max(r.width, r.height) < 40:
-            small_paths += 1
-    print(f"Total paths          : {len(global_paths)}")
-    print(f"Total 'l' operators  : {total_l}")
-    print(f"Small paths (<40pt)  : {small_paths}")
     return {
         "paths": global_paths,
         "global_rect": global_rect,
@@ -1926,41 +1913,16 @@ def render(page, objects, mode, out_path: Path, assembled=None):
 # Main
 # ------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Assemble multi-page sewing patterns and detect pieces + grain/fold lines"
-    )
-    parser.add_argument("--pattern-pdf", type=Path, required=True,
-                        help="PDF containing the pattern pieces")
-    parser.add_argument("--lines-pdf", type=Path, required=True,
-                        help="PDF containing instructions / grain / fold lines")
-    parser.add_argument("--pattern-pages", type=str, default=None,
-                        help="Pages from pattern PDF (0-based), e.g. '0-11' or '0,2,5-8'. Default = all")
-    parser.add_argument("--lines-pages", type=str, default=None,
-                        help="Pages from lines/instructions PDF. Default = all")
-    parser.add_argument("--overlap", type=float, default=0.0,
-                        help="Overlap between tiles in points (default 0.0)")
-
+    parser = argparse.ArgumentParser(description="Debug multi-page assembly")
+    parser.add_argument("--pattern-pdf", type=Path, required=True)
+    parser.add_argument("--lines-pdf", type=Path, required=True)
+    parser.add_argument("--pattern-pages", type=str, default=None)
+    parser.add_argument("--lines-pages", type=str, default=None)
+    parser.add_argument("--overlap", type=float, default=0.0)
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # Open documents
-    # ------------------------------------------------------------------
     pattern_doc = fitz.open(args.pattern_pdf)
     instr_doc   = fitz.open(args.lines_pdf)
-
-    print("\n=== ORIGINAL page statistics ===")
-    for pno in pat_pages:
-        page = pattern_doc[pno]
-        drawings = page.get_drawings()
-        total_l = 0
-        small_paths = 0
-        for p in drawings:
-            items = p.get("items", [])
-            total_l += sum(1 for it in items if it[0] == "l")
-            r = p.get("rect")
-            if r and max(r.width, r.height) < 40:
-                small_paths += 1
-        print(f"Page {pno}: paths={len(drawings):3d}   'l' ops={total_l:3d}   small paths={small_paths:3d}")    
 
     def parse_page_spec(spec, doc):
         if spec is None:
@@ -1970,7 +1932,7 @@ def main():
             part = part.strip()
             if "-" in part:
                 a, b = map(int, part.split("-"))
-                pages.extend(range(a, b + 1))
+                pages.extend(range(a, b+1))
             else:
                 pages.append(int(part))
         return sorted(set(p for p in pages if 0 <= p < len(doc)))
@@ -1984,19 +1946,21 @@ def main():
         raise SystemExit("No valid lines/instructions pages selected")
 
     print(f"Pattern pages : {pat_pages}")
-    print(f"Lines pages   : {line_pages}")
+    print(f"Lines pages   : {line_pages}")    
 
-    # ------------------------------------------------------------------
-    # Assemble pattern pages into one global coordinate system
-    # ------------------------------------------------------------------
-    assembled = assemble_pages(
-        pattern_doc, pat_pages,
-        instr_doc,   line_pages,
-        overlap=args.overlap,
-    )
+    print("=== PATTERN PDF ===")
+    assembled_pat = assemble_pages(pattern_doc, pat_pages,
+                                   instr_doc, line_pages,
+                                   overlap=args.overlap)
+
+    print("\n=== LINES / INSTRUCTIONS PDF ===")
+    assembled_lines = assemble_pages(instr_doc, line_pages,
+                                     instr_doc, line_pages,
+                                     overlap=args.overlap)
 
     # Page-like object so the existing detectors work unchanged
-    assembled_page = AssembledPage(assembled["paths"], assembled["global_rect"])
+    assembled_page_pat = AssembledPage(assembled_pat["paths"], assembled_pat["global_rect"])    
+    assembled_page_lines = AssembledPage(assembled_lines["paths"], assembled_lines["global_rect"])    
 
     # ------------------------------------------------------------------
     # Output location = same folder as the pattern PDF
@@ -2008,22 +1972,22 @@ def main():
     # Detect pattern pieces
     # ------------------------------------------------------------------
     print("\n=== Detecting pattern pieces ===")
-    pieces = detect_patterns(assembled_page)
+    pieces = detect_patterns(assembled_page_pat)
     print(f"Found {len(pieces)} pattern piece(s)")
     write_patterns_txt(pieces, out_dir / f"{stem}_patterns.txt")
     render(
-        assembled_page,
+        assembled_page_pat,
         pieces,
         "patterns",
         out_dir / f"{stem}_patterns.png",
-        assembled=assembled,
+        assembled=assembled_pat,
     )
 
     # ------------------------------------------------------------------
     # Detect special lines (grain / fold)
     # ------------------------------------------------------------------
     print("\n=== Detecting special lines ===")
-    lines = detect_special_lines(assembled_page)
+    lines = detect_special_lines(assembled_page_lines)
     print(f"Found {len(lines)} special line(s)")
     for i, obj in enumerate(lines):
         print(f"  [{i}] {obj['type']:5s}  score={obj['score']}  "
@@ -2031,11 +1995,11 @@ def main():
               f"segs={obj['shaft']['num_segments']}")
     write_lines_txt(lines, out_dir / f"{stem}_lines.txt")
     render(
-        assembled_page,
+        assembled_page_lines,
         lines,
         "lines",
         out_dir / f"{stem}_lines.png",
-        assembled=assembled,
+        assembled=assembled_lines,
     )
 
     pattern_doc.close()
