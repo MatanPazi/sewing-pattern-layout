@@ -2059,15 +2059,6 @@ if __name__ == "__main__":
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
-  # From what I've noticed, regardless of the orientation of the pages (portrait/landscape) the pages are either stacked one on top of the other, with #1 at the top, #2 below it etc.
-  
-  # OR
-  
-  # Horizontally with #1 the left most page, with the subsequent pages adding to its right. No grid.
-  
-  # And the decision should simply be based on do any of the paths exceed the page/rectangle boundries?
-  
-  # If so, do the extend horizontally or vertically?
-  
-  # And that should determine how the pages are combined.
-  # Please update assemble_pages accordingly
+# Main issue currently with itch pattern, a pattern piece is missing completely, and a length option (lining/main fabric seperation is ignored)
+
+# Also, may need to increase gap_threshold, missing some pattern pieces. Fine tune and perform regression tests.
