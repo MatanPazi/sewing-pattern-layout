@@ -238,12 +238,60 @@ def assemble_pages(pattern_doc, pattern_pages,
         print("No consistent content rectangle – using full page size")
 
     # ------------------------------------------------------------------
-    # 2. Simple grid decision (can be improved later)
+    # 2. Intelligent layout decision based on boundary overflows
     # ------------------------------------------------------------------
     n = len(pattern_pages)
-    cols = int(math.ceil(math.sqrt(n)))
-    rows = int(math.ceil(n / cols))
-    print(f"Using grid {cols}×{rows}")
+    horizontal_overflow = False
+    vertical_overflow = False
+
+    ref_x0 = content_rect.x0 if content_rect else 0
+    ref_y0 = content_rect.y0 if content_rect else 0
+    ref_x1 = content_rect.x1 if content_rect else tile_w
+    ref_y1 = content_rect.y1 if content_rect else tile_h
+
+    # Scan drawings to see which boundary is crossed
+    for pno in pattern_pages:
+        page = pattern_doc[pno]
+        for path in page.get_drawings():
+            for item in path.get("items", []):
+                op = item[0]
+                pts = []
+                if op == "l":
+                    pts = [item[1], item[2]]
+                elif op == "c":
+                    pts = item[1:]
+                elif op == "re":
+                    r = item[1]
+                    pts = [fitz.Point(r.x0, r.y0), fitz.Point(r.x1, r.y1)]
+                elif op == "qu":
+                    q = item[1]
+                    pts = [q.ul, q.ur, q.lr, q.ll]
+
+                for pt in pts:
+                    p = fitz.Point(pt)
+                    if p.x > ref_x1 + 1.0 or p.x < ref_x0 - 1.0:
+                        horizontal_overflow = True
+                    if p.y > ref_y1 + 1.0 or p.y < ref_y0 - 1.0:
+                        vertical_overflow = True
+
+    # Determine layout orientation based on overflow direction
+    if horizontal_overflow and not vertical_overflow:
+        cols, rows = n, 1
+        print("Detected horizontal extension: arranging pages in a single row")
+    elif vertical_overflow and not horizontal_overflow:
+        cols, rows = 1, n
+        print("Detected vertical extension: arranging pages in a single column")
+    else:
+        # Fallback based on page orientation if overflow is ambiguous or absent
+        sample = pattern_doc[pattern_pages[0]]
+        if sample.rect.width >= sample.rect.height:
+            cols, rows = n, 1
+            print("No clear overflow detected, defaulting to horizontal layout (landscape)")
+        else:
+            cols, rows = 1, n
+            print("No clear overflow detected, defaulting to vertical layout (portrait)")
+
+    print(f"Using grid {rows}×{cols}")
 
     # ------------------------------------------------------------------
     # 3. Place every path and collect real bounding box
@@ -263,7 +311,6 @@ def assemble_pages(pattern_doc, pattern_pages,
         ty = row * (tile_h - overlap)
 
         # Optional origin shift only if we have a content rect
-        # (we still keep the full geometry)
         if content_rect is not None:
             tx -= content_rect.x0
             ty -= content_rect.y0
@@ -311,7 +358,7 @@ def assemble_pages(pattern_doc, pattern_pages,
                     new_items.append(item)
 
             # ---- critical: keep a correct rect for this path ----
-            new_path = dict(path)          # preserve width, color, etc.
+            new_path = dict(path)  # preserve width, color, etc.
             new_path["items"] = new_items
             if xs and ys:
                 new_path["rect"] = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
@@ -2012,15 +2059,15 @@ if __name__ == "__main__":
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
-# From what I've noticed, regardless of the orientation of the pages (portrait/landscape) the pages are either stacked one on top of the other, with #1 at the top, #2 below it etc.
-
-# OR
-
-# Horizontally with #1 the left most page, with the subsequent pages adding to its right. No grid.
-
-# And the decision should simply be based on do any of the paths exceed the page/rectangle boundries?
-
-# If so, do the extend horizontally or vertically?
-
-# And that should determine how the pages are combined.
-# Please update assemble_pages accordingly
+  # From what I've noticed, regardless of the orientation of the pages (portrait/landscape) the pages are either stacked one on top of the other, with #1 at the top, #2 below it etc.
+  
+  # OR
+  
+  # Horizontally with #1 the left most page, with the subsequent pages adding to its right. No grid.
+  
+  # And the decision should simply be based on do any of the paths exceed the page/rectangle boundries?
+  
+  # If so, do the extend horizontally or vertically?
+  
+  # And that should determine how the pages are combined.
+  # Please update assemble_pages accordingly
