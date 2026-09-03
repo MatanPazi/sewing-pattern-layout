@@ -8,9 +8,17 @@ Outputs:
   - *_lines.txt
 
 Usage:
-    python outline_patterns.py input.pdf --mode patterns --page 0
-    python outline_patterns.py input.pdf --mode lines    --page 0
-    python outline_patterns.py input.pdf --mode both     --page 0
+    # Simplest – uses all pages from both PDFs
+    python outline_patterns.py \
+        --pattern-pdf pieces.pdf \
+        --lines-pdf instructions.pdf
+
+    # With explicit page ranges
+    python outline_patterns.py \
+        --pattern-pdf pieces.pdf \
+        --lines-pdf instructions.pdf \
+        --pattern-pages 0-23 \
+        --lines-pages 0-2        
 """
 
 import argparse
@@ -22,6 +30,18 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Rectangle
 
+
+class AssembledPage:
+    """Minimal page-like object so the existing detect_* functions keep working."""
+    def __init__(self, paths, rect):
+        self._paths = paths
+        self.rect = rect
+        self.mediabox = rect
+        self.cropbox = rect
+        self.rotation = 0
+
+    def get_drawings(self):
+        return self._paths
 
 # ------------------------------------------------------------------
 # Geometry helpers
@@ -116,6 +136,232 @@ class UnionFind:
             self.parent[rb] = ra
             self.rank[ra] += 1
 
+
+# ------------------------------------------------------------------
+# Multi-page assembly helpers
+# ------------------------------------------------------------------
+
+def _find_large_rectangles(page, min_area_ratio=0.55, min_side_ratio=0.60):
+    """
+    Return list of candidate content rectangles on a page.
+    Prefers a single 're' operator; also accepts 4-line rectangles.
+    """
+    drawings = page.get_drawings()
+    page_area = page.rect.width * page.rect.height
+    candidates = []
+
+    for path in drawings:
+        items = path.get("items", [])
+        if not items:
+            continue
+
+        # Case 1: pure rectangle operator
+        if len(items) == 1 and items[0][0] == "re":
+            r = items[0][1]
+            w, h = r.width, r.height
+            if (w * h >= min_area_ratio * page_area and
+                w >= min_side_ratio * page.rect.width and
+                h >= min_side_ratio * page.rect.height):
+                candidates.append(fitz.Rect(r))
+            continue
+
+        # Case 2: four long axis-aligned lines that form a rectangle
+        # (simplified but works for most pattern borders)
+        segs = path_to_segments(path)
+        if len(segs) < 4:
+            continue
+        # ... (you can expand this later if needed)
+
+    return candidates
+
+
+def _detect_content_rect(doc, page_numbers):
+    """
+    Look for a large rectangle that exists on *every* page of the given list.
+    Returns the median rectangle (in page coordinates) or None.
+    """
+    if not page_numbers:
+        return None
+
+    all_rects = []
+    for pno in page_numbers:
+        page = doc[pno]
+        rects = _find_large_rectangles(page)
+        if not rects:
+            return None          # must exist on every page
+        # take the largest one on this page
+        largest = max(rects, key=lambda r: r.width * r.height)
+        all_rects.append(largest)
+
+    # All pages have a large rect → check they are similar
+    widths  = [r.width  for r in all_rects]
+    heights = [r.height for r in all_rects]
+    if (max(widths)  - min(widths)  > 8.0 or
+        max(heights) - min(heights) > 8.0):
+        return None
+
+    # Return a representative rectangle (median position + size)
+    med_x0 = float(np.median([r.x0 for r in all_rects]))
+    med_y0 = float(np.median([r.y0 for r in all_rects]))
+    med_w  = float(np.median(widths))
+    med_h  = float(np.median(heights))
+    return fitz.Rect(med_x0, med_y0, med_x0 + med_w, med_y0 + med_h)
+
+
+def assemble_pages(pattern_doc, pattern_pages,
+                   instr_doc, instr_pages,
+                   overlap=0.0):
+    """
+    Assemble multi-page pattern into a single global coordinate system.
+    Returns a dict containing the transformed paths and a correctly sized canvas.
+    """
+    import math
+    import numpy as np
+
+    if not pattern_pages:
+        raise ValueError("No pattern pages given")
+
+    # ------------------------------------------------------------------
+    # 1. Detect content rectangle from the instruction layer
+    # ------------------------------------------------------------------
+    content_rect = _detect_content_rect(instr_doc, instr_pages)
+
+    if content_rect is not None:
+        tile_w = content_rect.width
+        tile_h = content_rect.height
+        print(f"Content rectangle detected: {tile_w:.1f} × {tile_h:.1f}")
+    else:
+        sample = pattern_doc[pattern_pages[0]]
+        tile_w = sample.rect.width
+        tile_h = sample.rect.height
+        content_rect = None
+        print("No consistent content rectangle – using full page size")
+
+    # ------------------------------------------------------------------
+    # 2. Simple grid decision (can be improved later)
+    # ------------------------------------------------------------------
+    n = len(pattern_pages)
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+    print(f"Using grid {cols}×{rows}")
+
+    # ------------------------------------------------------------------
+    # 3. Place every path and collect real bounding box
+    # ------------------------------------------------------------------
+    global_paths = []
+    page_transforms = []
+    all_x = []
+    all_y = []
+
+    for idx, pno in enumerate(pattern_pages):
+        page = pattern_doc[pno]
+        row = idx // cols
+        col = idx % cols
+
+        # Base translation – place tiles next to each other
+        tx = col * (tile_w - overlap)
+        ty = row * (tile_h - overlap)
+
+        # Optional origin shift only if we have a content rect
+        # (we still keep the full geometry)
+        if content_rect is not None:
+            tx -= content_rect.x0
+            ty -= content_rect.y0
+
+        mat = fitz.Matrix(1, 0, 0, 1, tx, ty)
+        page_transforms.append((pno, mat))
+
+        for path in page.get_drawings():
+            new_items = []
+            xs = []
+            ys = []
+
+            for item in path.get("items", []):
+                op = item[0]
+                if op == "l":
+                    p1 = fitz.Point(item[1]) * mat
+                    p2 = fitz.Point(item[2]) * mat
+                    new_items.append(("l", p1, p2))
+                    xs.extend([p1.x, p2.x])
+                    ys.extend([p1.y, p2.y])
+                elif op == "c":
+                    pts = [fitz.Point(p) * mat for p in item[1:]]
+                    new_items.append(("c", *pts))
+                    for p in pts:
+                        xs.append(p.x)
+                        ys.append(p.y)
+                elif op == "re":
+                    r = fitz.Rect(item[1]) * mat
+                    new_items.append(("re", r, item[2] if len(item) > 2 else 1))
+                    xs.extend([r.x0, r.x1])
+                    ys.extend([r.y0, r.y1])
+                elif op == "qu":
+                    q = item[1]
+                    ul = fitz.Point(q.ul) * mat
+                    ur = fitz.Point(q.ur) * mat
+                    lr = fitz.Point(q.lr) * mat
+                    ll = fitz.Point(q.ll) * mat
+                    new_items.append(("l", ul, ur))
+                    new_items.append(("l", ur, lr))
+                    new_items.append(("l", lr, ll))
+                    new_items.append(("l", ll, ul))
+                    xs.extend([ul.x, ur.x, lr.x, ll.x])
+                    ys.extend([ul.y, ur.y, lr.y, ll.y])
+                else:
+                    new_items.append(item)
+
+            # ---- critical: keep a correct rect for this path ----
+            new_path = dict(path)          # preserve width, color, etc.
+            new_path["items"] = new_items
+            if xs and ys:
+                new_path["rect"] = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+            else:
+                # fallback – should rarely happen
+                new_path["rect"] = fitz.Rect(tx, ty, tx + tile_w, ty + tile_h)
+
+            global_paths.append(new_path)
+
+            # also collect for the overall canvas
+            all_x.extend(xs)
+            all_y.extend(ys)
+
+    # ------------------------------------------------------------------
+    # 4. Real bounding box of everything + padding
+    # ------------------------------------------------------------------
+    if not all_x:
+        global_rect = fitz.Rect(0, 0, tile_w, tile_h)
+    else:
+        pad = 30.0
+        global_rect = fitz.Rect(
+            min(all_x) - pad,
+            min(all_y) - pad,
+            max(all_x) + pad,
+            max(all_y) + pad,
+        )
+
+    print(f"Final canvas: {global_rect.width:.1f} × {global_rect.height:.1f}")
+    print("\n=== Path statistics after assembly ===")
+    total_l = 0
+    small_paths = 0
+    for p in global_paths:
+        items = p.get("items", [])
+        l_count = sum(1 for it in items if it[0] == "l")
+        total_l += l_count
+        r = p.get("rect")
+        if r and max(r.width, r.height) < 40:
+            small_paths += 1
+    print(f"Total paths          : {len(global_paths)}")
+    print(f"Total 'l' operators  : {total_l}")
+    print(f"Small paths (<40pt)  : {small_paths}")
+    return {
+        "paths": global_paths,
+        "global_rect": global_rect,
+        "content_rect": content_rect,
+        "tile_w": tile_w,
+        "tile_h": tile_h,
+        "grid": (cols, rows),
+        "page_transforms": page_transforms,
+    }
 
 # ------------------------------------------------------------------
 # PATTERN detection
@@ -1514,23 +1760,58 @@ def write_lines_txt(lines, out_path: Path):
 # ------------------------------------------------------------------
 # Rendering
 # ------------------------------------------------------------------
-def render(page, objects, mode, out_path: Path):
-    page_rect = page.rect
-    fig, ax = plt.subplots(figsize=(12, 12 * page_rect.height / page_rect.width))
-    ax.set_xlim(page_rect.x0, page_rect.x1)
-    ax.set_ylim(page_rect.y1, page_rect.y0)
-    ax.set_aspect("equal")
-    ax.axis("off")
-    ax.set_title(f"{mode.upper()} detection")
+def render(page, objects, mode, out_path: Path, assembled=None):
+    """
+    Render detection results.
+    
+    - assembled=None  → classic single-page render (with PDF background)
+    - assembled=dict  → single large assembled canvas (no background image)
+    """
+    if assembled is not None:
+        # ---------- multi-page assembled view ----------
+        global_rect = assembled["global_rect"]
+        fig_w = 16
+        fig_h = max(8.0, fig_w * global_rect.height / max(global_rect.width, 1.0))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        ax.set_xlim(global_rect.x0 - 10, global_rect.x1 + 10)
+        ax.set_ylim(global_rect.y1 + 10, global_rect.y0 - 10)  # PDF y-down
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(
+            f"{mode.upper()} – assembled view  "
+            f"({assembled['grid'][0]}×{assembled['grid'][1]} tiles)"
+        )
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-    ax.imshow(
-        img,
-        extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
-        alpha=0.40,
-        zorder=0,
-    )
+        # Light tile grid
+        tile_w = assembled["tile_w"]
+        tile_h = assembled["tile_h"]
+        cols, rows = assembled["grid"]
+        for r in range(rows + 1):
+            y = r * tile_h
+            ax.axhline(y, color="0.85", linewidth=0.6, zorder=0)
+        for c in range(cols + 1):
+            x = c * tile_w
+            ax.axvline(x, color="0.85", linewidth=0.6, zorder=0)
+
+    else:
+        # ---------- classic single-page render ----------
+        page_rect = page.rect
+        fig, ax = plt.subplots(figsize=(12, 12 * page_rect.height / page_rect.width))
+        ax.set_xlim(page_rect.x0, page_rect.x1)
+        ax.set_ylim(page_rect.y1, page_rect.y0)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(f"{mode.upper()} detection")
+
+        # PDF background
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        ax.imshow(
+            img,
+            extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
+            alpha=0.40,
+            zorder=0,
+        )
 
     colors = plt.cm.tab10.colors
 
@@ -1549,7 +1830,7 @@ def render(page, objects, mode, out_path: Path):
                 )
                 ax.add_collection(lc)
 
-            # Length options in a contrasting style
+            # Length options
             for vi, variant in enumerate(piece.get("size_variants", []) or []):
                 segs = variant.get("segments") or []
                 if not segs:
@@ -1559,12 +1840,10 @@ def render(page, objects, mode, out_path: Path):
                     colors=["orange"],
                     linewidths=2.2,
                     alpha=0.9,
-                    linestyles="solid",
                     zorder=4,
                 )
                 ax.add_collection(lc)
 
-                # Label option near first segment midpoint if possible
                 (x1, y1), (x2, y2) = segs[0]
                 ax.text(
                     (x1 + x2) / 2,
@@ -1577,7 +1856,7 @@ def render(page, objects, mode, out_path: Path):
                     zorder=5,
                 )
 
-            # BBox + piece index
+            # Bounding box + index
             x0, y0, x1, y1 = piece["bbox"]
             rect = Rectangle(
                 (x0, y0),
@@ -1602,25 +1881,30 @@ def render(page, objects, mode, out_path: Path):
                 zorder=6,
             )
 
-        # Small legend
+        # Legend
         ax.text(
-            page_rect.x0 + 10,
-            page_rect.y0 + 20,
-            "Solid coloured = main outline\nOrange = length options\n",
+            0.02, 0.02,
+            "Solid coloured = main outline\nOrange = length options",
+            transform=ax.transAxes,
             fontsize=8,
-            color="black",
-            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=3),
+            verticalalignment="bottom",
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
             zorder=7,
         )
 
-    else:
-        # lines mode unchanged
+    else:  # lines mode
         for i, obj in enumerate(objects):
             color = "red" if obj["type"] == "grain" else "purple"
-            lc = LineCollection(obj["all_segments"], colors=color, linewidths=2.2, alpha=0.9)
+            lc = LineCollection(
+                obj["all_segments"],
+                colors=color,
+                linewidths=2.2,
+                alpha=0.9,
+                zorder=3,
+            )
             ax.add_collection(lc)
             for ep in obj["shaft"]["endpoints"]:
-                ax.plot(ep[0], ep[1], "o", color="orange", markersize=6)
+                ax.plot(ep[0], ep[1], "o", color="orange", markersize=6, zorder=4)
             ax.text(
                 obj["shaft"]["endpoints"][0][0],
                 obj["shaft"]["endpoints"][0][1],
@@ -1629,6 +1913,7 @@ def render(page, objects, mode, out_path: Path):
                 fontsize=9,
                 fontweight="bold",
                 bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"),
+                zorder=5,
             )
 
     plt.tight_layout()
@@ -1641,48 +1926,125 @@ def render(page, objects, mode, out_path: Path):
 # Main
 # ------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("pdf", type=Path)
-    parser.add_argument("--mode", choices=["patterns", "lines", "both"], default="both")
-    parser.add_argument("--page", type=int, default=0)
-    parser.add_argument("--out-dir", type=Path, default=None)
+    parser = argparse.ArgumentParser(
+        description="Assemble multi-page sewing patterns and detect pieces + grain/fold lines"
+    )
+    parser.add_argument("--pattern-pdf", type=Path, required=True,
+                        help="PDF containing the pattern pieces")
+    parser.add_argument("--lines-pdf", type=Path, required=True,
+                        help="PDF containing instructions / grain / fold lines")
+    parser.add_argument("--pattern-pages", type=str, default=None,
+                        help="Pages from pattern PDF (0-based), e.g. '0-11' or '0,2,5-8'. Default = all")
+    parser.add_argument("--lines-pages", type=str, default=None,
+                        help="Pages from lines/instructions PDF. Default = all")
+    parser.add_argument("--overlap", type=float, default=0.0,
+                        help="Overlap between tiles in points (default 0.0)")
 
     args = parser.parse_args()
 
-    doc = fitz.open(args.pdf)
-    page = doc[args.page]
+    # ------------------------------------------------------------------
+    # Open documents
+    # ------------------------------------------------------------------
+    pattern_doc = fitz.open(args.pattern_pdf)
+    instr_doc   = fitz.open(args.lines_pdf)
 
-    out_dir = args.out_dir or args.pdf.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{args.pdf.stem}_p{args.page:02d}"
+    print("\n=== ORIGINAL page statistics ===")
+    for pno in pat_pages:
+        page = pattern_doc[pno]
+        drawings = page.get_drawings()
+        total_l = 0
+        small_paths = 0
+        for p in drawings:
+            items = p.get("items", [])
+            total_l += sum(1 for it in items if it[0] == "l")
+            r = p.get("rect")
+            if r and max(r.width, r.height) < 40:
+                small_paths += 1
+        print(f"Page {pno}: paths={len(drawings):3d}   'l' ops={total_l:3d}   small paths={small_paths:3d}")    
 
-    if args.mode in ("patterns", "both"):
-        pieces = detect_patterns(
-            page,
-        )
-        print(f"Found {len(pieces)} pattern piece(s)")
-        write_patterns_txt(pieces, out_dir / f"{stem}_patterns.txt")
-        render(page, pieces, "patterns", out_dir / f"{stem}_patterns.png")
+    def parse_page_spec(spec, doc):
+        if spec is None:
+            return list(range(len(doc)))
+        pages = []
+        for part in spec.split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = map(int, part.split("-"))
+                pages.extend(range(a, b + 1))
+            else:
+                pages.append(int(part))
+        return sorted(set(p for p in pages if 0 <= p < len(doc)))
 
-    if args.mode in ("lines", "both"):
-        lines = detect_special_lines(
-            page,
-        )
-        print(f"Found {len(lines)} special line(s)")
-        for i, obj in enumerate(lines):
-            print(f"  [{i}] {obj['type']:5s}  score={obj['score']}  "
-                  f"shaft_len={obj['shaft']['length']:.1f}  segs={obj['shaft']['num_segments']}")
-        write_lines_txt(lines, out_dir / f"{stem}_lines.txt")
-        render(page, lines, "lines", out_dir / f"{stem}_lines.png")
+    pat_pages  = parse_page_spec(args.pattern_pages, pattern_doc)
+    line_pages = parse_page_spec(args.lines_pages,   instr_doc)
 
-    doc.close()
+    if not pat_pages:
+        raise SystemExit("No valid pattern pages selected")
+    if not line_pages:
+        raise SystemExit("No valid lines/instructions pages selected")
 
+    print(f"Pattern pages : {pat_pages}")
+    print(f"Lines pages   : {line_pages}")
 
+    # ------------------------------------------------------------------
+    # Assemble pattern pages into one global coordinate system
+    # ------------------------------------------------------------------
+    assembled = assemble_pages(
+        pattern_doc, pat_pages,
+        instr_doc,   line_pages,
+        overlap=args.overlap,
+    )
+
+    # Page-like object so the existing detectors work unchanged
+    assembled_page = AssembledPage(assembled["paths"], assembled["global_rect"])
+
+    # ------------------------------------------------------------------
+    # Output location = same folder as the pattern PDF
+    # ------------------------------------------------------------------
+    out_dir = args.pattern_pdf.parent
+    stem = f"{args.pattern_pdf.stem}_assembled"
+
+    # ------------------------------------------------------------------
+    # Detect pattern pieces
+    # ------------------------------------------------------------------
+    print("\n=== Detecting pattern pieces ===")
+    pieces = detect_patterns(assembled_page)
+    print(f"Found {len(pieces)} pattern piece(s)")
+    write_patterns_txt(pieces, out_dir / f"{stem}_patterns.txt")
+    render(
+        assembled_page,
+        pieces,
+        "patterns",
+        out_dir / f"{stem}_patterns.png",
+        assembled=assembled,
+    )
+
+    # ------------------------------------------------------------------
+    # Detect special lines (grain / fold)
+    # ------------------------------------------------------------------
+    print("\n=== Detecting special lines ===")
+    lines = detect_special_lines(assembled_page)
+    print(f"Found {len(lines)} special line(s)")
+    for i, obj in enumerate(lines):
+        print(f"  [{i}] {obj['type']:5s}  score={obj['score']}  "
+              f"shaft_len={obj['shaft']['length']:.1f}  "
+              f"segs={obj['shaft']['num_segments']}")
+    write_lines_txt(lines, out_dir / f"{stem}_lines.txt")
+    render(
+        assembled_page,
+        lines,
+        "lines",
+        out_dir / f"{stem}_lines.png",
+        assembled=assembled,
+    )
+
+    pattern_doc.close()
+    instr_doc.close()
+    print("\nDone.")
+    
 if __name__ == "__main__":
     main()
 
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
-
-# current issue with "ultimate" pattern piece.
