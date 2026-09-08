@@ -772,6 +772,7 @@ def detect_patterns(page,
             "t0": t0,
             "t1": t1,
             "length": length,
+            "style": (color_key(color),),
         })
 
     n_paths = len(paths)
@@ -785,7 +786,7 @@ def detect_patterns(page,
     # terminal records: (path_local, end_idx 0/1, xy, style)
     terms = []
     for i, p in enumerate(paths):
-        style = (p["color"], p["width"])
+        style = p["style"]
         terms.append((i, 0, p["t0"], style))
         terms.append((i, 1, p["t1"], style))
 
@@ -830,7 +831,7 @@ def detect_patterns(page,
             "path_local": i,
             "n0": n0,
             "n1": n1,
-            "style": (p["color"], p["width"]),
+            "style": p["style"],
             "length": p["length"],
             "path_id": p["id"],
             "segments": p["segments"],
