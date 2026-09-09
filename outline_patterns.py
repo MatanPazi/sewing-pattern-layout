@@ -2060,6 +2060,7 @@ if __name__ == "__main__":
 
 # TODO:
 # Add support for pattern pieces spanning 2 (Or more than 1) pages.
-# Main issue currently with itch pattern, a pattern piece is missing completely, and a length option (lining/main fabric seperation is ignored)
+# Main issue currently with itch pattern, and a length option (lining/main fabric seperation is ignored)
+# Seems like the issue is due to the paths joining only at their endpoints and the lining vertical line joins the horizontal segment in the middle.
 
 # Also, may need to increase gap_threshold, missing some pattern pieces. Fine tune and perform regression tests.
