@@ -30,6 +30,10 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Rectangle
 
+from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.ops import polygonize, unary_union, split
+from shapely.validation import make_valid
+import math
 
 class AssembledPage:
     """Minimal page-like object so the existing detect_* functions keep working."""
@@ -46,6 +50,63 @@ class AssembledPage:
 # ------------------------------------------------------------------
 # Geometry helpers
 # ------------------------------------------------------------------
+def dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _ordered_points_from_segments(segs, dist_fn=None):
+    """
+    Turn an unordered list of segments into an ordered point list
+    that walks the chain as well as possible.
+    """
+    if not segs:
+        return []
+
+    if dist_fn is None:
+        def dist_fn(a, b):
+            return math.hypot(a[0]-b[0], a[1]-b[1])
+
+    from collections import defaultdict
+
+    def key(p):
+        return (round(p[0], 3), round(p[1], 3))
+
+    adj = defaultdict(list)
+    pts = {}
+    for a, b in segs:
+        ka, kb = key(a), key(b)
+        pts[ka] = a
+        pts[kb] = b
+        adj[ka].append(kb)
+        adj[kb].append(ka)
+
+    # Start from a degree-1 node if possible, otherwise any node
+    start = None
+    for k, nbrs in adj.items():
+        if len(set(nbrs)) == 1:
+            start = k
+            break
+    if start is None:
+        start = next(iter(adj))
+
+    ordered = []
+    visited = set()
+    cur = start
+    prev = None
+
+    while cur is not None and cur not in visited:
+        visited.add(cur)
+        ordered.append(pts[cur])
+        candidates = [n for n in adj[cur] if n != prev]
+        # Prefer unvisited
+        candidates = [n for n in candidates if n not in visited] or candidates
+        if not candidates:
+            break
+        # Take the first (or the one that continues the direction – simple version)
+        prev, cur = cur, candidates[0]
+
+    return ordered
+
 def path_to_segments(path):
     segments = []
     for item in path.get("items", []):
@@ -421,9 +482,6 @@ def detect_patterns(page,
     def quant(p):
         return (round(p[0] / point_tol), round(p[1] / point_tol))
 
-    def dist(a, b):
-        return math.hypot(a[0] - b[0], a[1] - b[1])
-
     def color_key(c):
         if not c:
             return None
@@ -793,19 +851,6 @@ def detect_patterns(page,
     for i, p in enumerate(pieces):
         print(f"  [{i}] paths={len(p['path_ids'])} area={p['area']:.0f}")
     return pieces
-
-
-def _ordered_points_from_segments(segs, dist_fn):
-    if not segs:
-        return []
-    pts = [segs[0][0], segs[0][1]]
-    for a, b in segs[1:]:
-        if dist_fn(pts[-1], a) <= dist_fn(pts[-1], b):
-            pts.append(b)
-        else:
-            pts.append(a)
-    return pts
-
 
 def _dedupe_cycles(cycles):
     out = []
@@ -1453,6 +1498,219 @@ def render(page, objects, mode, out_path: Path, assembled=None):
     print(f"Saved PNG → {out_path}")
 
 
+def render_faces(page, faces_per_piece, out_path: Path, assembled=None):
+    """
+    Draw every atomic face in a different colour on top of the page
+    (or on the assembled canvas).
+    """
+    if assembled is not None:
+        global_rect = assembled["global_rect"]
+        fig_w = 16
+        fig_h = max(8.0, fig_w * global_rect.height / max(global_rect.width, 1.0))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        ax.set_xlim(global_rect.x0 - 10, global_rect.x1 + 10)
+        ax.set_ylim(global_rect.y1 + 10, global_rect.y0 - 10)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title("Atomic faces (clickable regions)")
+    else:
+        page_rect = page.rect
+        fig, ax = plt.subplots(figsize=(12, 12 * page_rect.height / page_rect.width))
+        ax.set_xlim(page_rect.x0, page_rect.x1)
+        ax.set_ylim(page_rect.y1, page_rect.y0)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title("Atomic faces")
+
+        # faint PDF background
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        ax.imshow(
+            img,
+            extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
+            alpha=0.35,
+            zorder=0,
+        )
+
+    colors = plt.cm.tab20.colors
+    face_id = 0
+
+    for piece_idx, faces in faces_per_piece:
+        for fi, face in enumerate(faces):
+            color = colors[face_id % len(colors)]
+            face_id += 1
+
+            # filled region
+            from matplotlib.patches import Polygon as MplPolygon
+            poly = MplPolygon(
+                face["points"],
+                closed=True,
+                facecolor=color,
+                edgecolor="black",
+                linewidth=1.2,
+                alpha=0.45,
+                zorder=3,
+            )
+            ax.add_patch(poly)
+
+            # label
+            cx = sum(p[0] for p in face["points"]) / len(face["points"])
+            cy = sum(p[1] for p in face["points"]) / len(face["points"])
+            ax.text(
+                cx, cy,
+                f"{piece_idx}.{fi}",
+                color="black",
+                fontsize=9,
+                fontweight="bold",
+                ha="center", va="center",
+                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1),
+                zorder=5,
+            )
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved faces PNG → {out_path}")
+
+# ------------------------------------------------------------------
+# REGION / FACE DETECTION (Shapely)
+# ------------------------------------------------------------------
+
+def _extend_line(ls, factor=1.6):
+    """Extend a LineString beyond its endpoints so it is guaranteed to cross a surrounding boundary."""
+    coords = list(ls.coords)
+    if len(coords) < 2:
+        return ls
+    (x0, y0), (x1, y1) = coords[0], coords[-1]
+    dx, dy = x1 - x0, y1 - y0
+    # push both ends outward
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    half = factor / 2
+    new0 = (cx - dx * half, cy - dy * half)
+    new1 = (cx + dx * half, cy + dy * half)
+    return LineString([new0, new1])
+
+
+def detect_faces_for_piece(main_piece,
+                           all_segs_with_id,
+                           min_face_area=500.0,
+                           snap_tol=2.5,
+                           inside_tol=6.0):
+    # ---- outer boundary ----
+    pts = main_piece.get("points")
+    if not pts or len(pts) < 3:
+        pts = _ordered_points_from_segments(main_piece["segments"], dist)
+    if len(pts) < 3:
+        return []
+
+    try:
+        outer = Polygon(pts)
+        if not outer.is_valid:
+            outer = make_valid(outer)
+        if outer.geom_type == "MultiPolygon":
+            outer = max(outer.geoms, key=lambda g: g.area)
+        if outer.is_empty or outer.area < 1.0:
+            return []
+    except Exception:
+        return []
+
+    main_path_ids = set(main_piece.get("path_ids", []))
+
+    # ---- candidate internal segments ----
+    candidates = []
+    for path_id, (a, b) in all_segs_with_id:
+        if path_id in main_path_ids:
+            continue
+        if dist(a, b) < 1.0:
+            continue
+        ls = LineString([a, b])
+        if outer.intersects(ls) or outer.distance(ls) <= inside_tol:
+            candidates.append(ls)
+
+    print(f"  → {len(candidates)} candidate internal segments for this piece")
+
+    if not candidates:
+        # nothing to cut
+        coords = list(outer.exterior.coords)
+        return [{
+            "polygon": outer,
+            "segments": [(coords[i], coords[i+1]) for i in range(len(coords)-1)],
+            "points": coords[:-1],
+            "area": float(outer.area),
+            "bbox": outer.bounds,
+        }]
+
+    # ---- robust arrangement ----
+    # 1. closed outer boundary as LineString
+    boundary = LineString(list(outer.exterior.coords))
+
+    # 2. extend every cutter so it is guaranteed to cross the boundary
+    extended = [_extend_line(c, factor=1.8) for c in candidates]
+
+    # 3. node everything
+    all_lines = [boundary] + extended
+    noded = unary_union(MultiLineString(all_lines))
+
+    # 4. polygonize
+    raw_faces = list(polygonize(noded))
+
+    # 5. keep only faces whose centroid is inside the original outer
+    result = []
+    for face in raw_faces:
+        if face.is_empty or face.area < min_face_area:
+            continue
+        try:
+            cen = face.centroid
+            if not outer.contains(cen) and not outer.touches(cen):
+                continue
+            # final clip for safety
+            inter = face.intersection(outer)
+            if inter.is_empty:
+                continue
+            if inter.geom_type == "MultiPolygon":
+                inter = max(inter.geoms, key=lambda g: g.area)
+            if inter.geom_type != "Polygon" or inter.area < min_face_area:
+                continue
+            face = inter
+        except Exception:
+            continue
+
+        coords = list(face.exterior.coords)
+        if len(coords) < 3:
+            continue
+        segs = [(coords[i], coords[i+1]) for i in range(len(coords)-1)]
+        result.append({
+            "polygon": face,
+            "segments": segs,
+            "points": coords[:-1],
+            "area": float(face.area),
+            "bbox": face.bounds,
+        })
+
+    result.sort(key=lambda f: f["area"], reverse=True)
+    return result
+
+def detect_all_faces(pieces, page, **kwargs):
+    """
+    Collect every stroked segment together with its original path index,
+    then run face detection for each main piece.
+    """
+    all_segs_with_id = []          # list of (path_id, segment)
+    for path_id, path in enumerate(page.get_drawings()):
+        segs = path_to_segments(path)
+        for s in segs:
+            all_segs_with_id.append((path_id, s))
+
+    print(f"Total segments on page: {len(all_segs_with_id)}")
+
+    out = []
+    for i, piece in enumerate(pieces):
+        faces = detect_faces_for_piece(piece, all_segs_with_id, **kwargs)
+        out.append((i, faces))
+        print(f"Piece {i}: {len(faces)} atomic face(s)  "
+              f"(main area={piece.get('area', 0):.0f})")
+    return out
+
 # ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
@@ -1545,6 +1803,36 @@ def main():
         out_dir / f"{stem}_lines.png",
         assembled=assembled_lines,
     )
+
+    # Collect every segment that was drawn on the page
+    all_segments = []
+    for path in assembled_page_pat.get_drawings():
+        segs = path_to_segments(path)
+        all_segments.extend(segs)
+
+    # ------------------------------------------------------------------
+    # Detect faces inside each pattern piece
+    # ------------------------------------------------------------------
+    print("\n=== Detecting atomic faces ===")
+    faces_per_piece = detect_all_faces(
+        pieces,
+        assembled_page_pat,
+        min_face_area=400.0,
+        snap_tol=3.0,
+        inside_tol=8.0,
+    )
+
+    for piece_idx, faces in faces_per_piece:
+        print(f"  Piece {piece_idx}: {len(faces)} face(s)")
+
+    # visualise
+    render_faces(
+        assembled_page_pat,
+        faces_per_piece,
+        out_dir / f"{stem}_faces.png",
+        assembled=assembled_pat,
+    )
+
 
     pattern_doc.close()
     instr_doc.close()
