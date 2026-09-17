@@ -404,279 +404,19 @@ def detect_patterns(page,
                     gap_threshold=20.0,
                     point_tol=1.0,
                     min_perimeter=250.0,
-                    min_polygon_area=8000.0,
-                    min_option_length=60.0,
-                    attach_tol=12.0):
+                    min_polygon_area=8000.0):
     """
-    Goal 2 pattern detection via generic geometric graph cycles.
+    Detect main closed (or near-closed) pattern outlines via geometric graph cycles.
 
     - Each stroked path is an edge between two terminals
     - Same-style terminals snap within gap_threshold
     - Closed outlines = cycles of any number of paths
     - Near-cycles allowed when chain ends are within gap
-    - Length options = one joined chain per alternate style attached to a main cycle
     """
-    from collections import defaultdict, Counter
+    from collections import defaultdict
     import math
 
     drawings = page.get_drawings()
-
-    def variant_key(v, tol=8.0):
-        """
-        Produce a quantization key so that near-identical lines fall into the same bucket.
-        Uses the midpoint and the dominant orientation.
-        """
-        segs = v["segments"]
-        if not segs:
-            return None
-        # midpoint
-        pts = [p for s in segs for p in s]
-        mx = sum(p[0] for p in pts) / len(pts)
-        my = sum(p[1] for p in pts) / len(pts)
-        # rough direction
-        p0, p1 = segs[0][0], segs[-1][1]
-        dx, dy = abs(p1[0] - p0[0]), abs(p1[1] - p0[1])
-        horizontal = dx >= dy
-        # quantize
-        qx = round(mx / tol)
-        qy = round(my / tol)
-        return (horizontal, qx, qy)
-
-    def deduplicate_variants(variants, tol=8.0):
-        """
-        Keep only one variant per location.
-        Preference: longer one, then the one with more path_ids (or any stable rule).
-        """
-        groups = {}
-        for v in variants:
-            key = variant_key(v, tol=tol)
-            if key is None:
-                continue
-            if key not in groups:
-                groups[key] = v
-            else:
-                # keep the longer one (or the first, or the one with smaller path id…)
-                if v["length"] > groups[key]["length"]:
-                    groups[key] = v
-        return list(groups.values())
-
-    def segment_direction(p):
-        """Return normalized direction vector of a path (from t0 to t1)."""
-        dx = p["t1"][0] - p["t0"][0]
-        dy = p["t1"][1] - p["t0"][1]
-        length = math.hypot(dx, dy)
-        if length < 1e-8:
-            return (0.0, 0.0), 0.0
-        return (dx / length, dy / length), length
-
-    def angle_between(v1, v2):
-        """Smallest angle in degrees between two normalized vectors."""
-        dot = max(-1.0, min(1.0, v1[0]*v2[0] + v1[1]*v2[1]))
-        return math.degrees(math.acos(dot))
-
-    def max_endpoint_distance(p1, p2):
-        """Largest distance among the four endpoints."""
-        pts = [p1["t0"], p1["t1"], p2["t0"], p2["t1"]]
-        best = 0.0
-        for i in range(4):
-            for j in range(i+1, 4):
-                d = dist(pts[i], pts[j])
-                if d > best:
-                    best = d
-        return best
-
-    def should_join(p1, p2, gap, parallel_angle_tol=5.0, span_eps=0.08):
-        """
-        Decide whether two nearby paths should be merged into one component.
-        
-        - If they form a noticeable angle → allow join (polyline corner / continuation).
-        - If nearly parallel → only join when the combined span is clearly larger
-        than the longer individual segment (i.e. they extend each other,
-        not sit on top of one another).
-        """
-        (d1, len1) = segment_direction(p1)
-        (d2, len2) = segment_direction(p2)
-
-        if len1 < 1e-6 or len2 < 1e-6:
-            return False
-
-        ang = angle_between(d1, d2)
-        ang = min(ang, 180.0 - ang)          # smallest angle
-
-        if ang > parallel_angle_tol:
-            # Clearly not parallel – treat as normal continuation / corner
-            return True
-
-        # Nearly parallel: check whether the overall span grows
-        combined_span = max_endpoint_distance(p1, p2)
-        longer = max(len1, len2)
-
-        # Allow join only if the farthest endpoints are meaningfully farther
-        # apart than the longer segment alone
-        if combined_span > longer * (1.0 + span_eps):
-            return True
-
-        # Special case: very short segment attaching to a long one
-        # (common in dashed lines). Require at least a small absolute growth.
-        if combined_span > longer + max(gap * 0.7, 3.0):
-            return True
-
-        return False
-
-    def ordered_chain_endpoints(segs):
-        """
-        Return the two terminal points of a chain of segments.
-        Handles reversed segments and unordered input reasonably well.
-        """
-        if not segs:
-            return None, None
-
-        # Build a simple adjacency of points (rounded to avoid float noise)
-        from collections import defaultdict
-        def key(p):
-            return (round(p[0], 3), round(p[1], 3))
-
-        adj = defaultdict(list)
-        points = {}
-        for a, b in segs:
-            ka, kb = key(a), key(b)
-            points[ka] = a
-            points[kb] = b
-            adj[ka].append(kb)
-            adj[kb].append(ka)
-
-        # Terminals = points with degree 1 (or the two farthest if the graph is messy)
-        deg1 = [k for k, nbrs in adj.items() if len(set(nbrs)) == 1]
-        if len(deg1) >= 2:
-            # pick the pair of degree-1 points that are farthest apart
-            best = 0.0
-            t0 = t1 = None
-            for i in range(len(deg1)):
-                for j in range(i+1, len(deg1)):
-                    d = dist(points[deg1[i]], points[deg1[j]])
-                    if d > best:
-                        best = d
-                        t0, t1 = points[deg1[i]], points[deg1[j]]
-            return t0, t1
-
-        # Fallback: just the farthest pair of any points
-        pts = list(points.values())
-        best = 0.0
-        t0 = t1 = pts[0]
-        for i in range(len(pts)):
-            for j in range(i+1, len(pts)):
-                d = dist(pts[i], pts[j])
-                if d > best:
-                    best = d
-                    t0, t1 = pts[i], pts[j]
-        return t0, t1
-
-
-    def attachment_chord(segs, main_segs, tol=None):
-        """
-        Distance between the two points of the candidate that lie closest
-        to the main outline (i.e. the true attachment points).
-        Falls back to geometric endpoints if needed.
-        """
-        if tol is None:
-            tol = attach_tol * 1.5
-
-        # Collect candidate points (all vertices)
-        cand_pts = []
-        for a, b in segs:
-            cand_pts.append(a)
-            cand_pts.append(b)
-        # dedup
-        seen = set()
-        uniq = []
-        for p in cand_pts:
-            k = (round(p[0], 3), round(p[1], 3))
-            if k not in seen:
-                seen.add(k)
-                uniq.append(p)
-
-        # Points that are close to the main outline
-        attached = [p for p in uniq if point_to_polyline_dist(p, main_segs) <= tol]
-
-        if len(attached) >= 2:
-            # farthest pair among the attached points
-            best = 0.0
-            for i in range(len(attached)):
-                for j in range(i+1, len(attached)):
-                    d = dist(attached[i], attached[j])
-                    if d > best:
-                        best = d
-            return best
-
-        # Fallback: geometric endpoints of the chain
-        p0, p1 = ordered_chain_endpoints(segs)
-        # print(f"pids={pids}  length={length:.2f}  "
-        #     f"geom_chord={dist(p0,p1) if p0 else 0:.2f}  "
-        #     f"attach_chord={attachment_chord(segs, m['segments']):.2f}  "
-        #     f"ratio={length / max(chord, 1e-6):.3f}")                
-        if p0 is None:
-            return 0.0
-        return dist(p0, p1)
-
-    def point_to_segment_dist(p, a, b):
-        ax, ay = a
-        bx, by = b
-        px, py = p
-        dx, dy = bx - ax, by - ay
-        len_sq = dx*dx + dy*dy
-        if len_sq < 1e-12:
-            return math.hypot(px-ax, py-ay)
-        t = max(0.0, min(1.0, ((px-ax)*dx + (py-ay)*dy) / len_sq))
-        projx = ax + t*dx
-        projy = ay + t*dy
-        return math.hypot(px-projx, py-projy)
-
-    def point_to_polyline_dist(p, segs):
-        if not segs:
-            return float("inf")
-        return min(point_to_segment_dist(p, a, b) for a, b in segs)
-
-    def attaches(chain_segs, main_segs, tol=None):
-        if tol is None:
-            tol = attach_tol
-        if not chain_segs or not main_segs:
-            return False
-        # both endpoints of every segment in the candidate (handles multi-seg options)
-        ends = []
-        for a, b in chain_segs:
-            ends.append(a)
-            ends.append(b)
-        # dedup
-        seen = set()
-        uniq = []
-        for e in ends:
-            key = (round(e[0], 2), round(e[1], 2))
-            if key not in seen:
-                seen.add(key)
-                uniq.append(e)
-        for e in uniq:
-            if point_to_polyline_dist(e, main_segs) <= tol:
-                return True
-        return False
-
-    def is_mostly_axis_aligned(segs, max_angle_dev_deg=15.0):
-        """True if the chain is predominantly horizontal or vertical."""
-        if not segs:
-            return False
-        total_len = 0.0
-        axis_len = 0.0
-        for a, b in segs:
-            dx = b[0] - a[0]
-            dy = b[1] - a[1]
-            ln = math.hypot(dx, dy)
-            if ln < 1e-6:
-                continue
-            total_len += ln
-            ang = abs(math.degrees(math.atan2(dy, dx))) % 180.0
-            # near 0° or 90°
-            if min(ang, 180 - ang, abs(ang - 90)) <= max_angle_dev_deg:
-                axis_len += ln
-        return total_len > 0 and axis_len / total_len >= 0.85
 
     def quant(p):
         return (round(p[0] / point_tol), round(p[1] / point_tol))
@@ -783,7 +523,6 @@ def detect_patterns(page,
     # ------------------------------------------------------------------
     # 2) Same-style terminal snapping → graph nodes
     # ------------------------------------------------------------------
-    # terminal records: (path_local, end_idx 0/1, xy, style)
     terms = []
     for i, p in enumerate(paths):
         style = p["style"]
@@ -821,8 +560,7 @@ def detect_patterns(page,
     def node_id(path_local, end_idx):
         return find(path_local * 2 + end_idx)
 
-    # path edge endpoints in snapped node space
-    edges = []  # dicts
+    edges = []
     for i, p in enumerate(paths):
         n0 = node_id(i, 0)
         n1 = node_id(i, 1)
@@ -837,14 +575,13 @@ def detect_patterns(page,
             "segments": p["segments"],
         })
 
-    # adjacency: node -> list of edge indices
     adj = defaultdict(list)
     for ei, e in enumerate(edges):
         adj[e["n0"]].append(ei)
         adj[e["n1"]].append(ei)
 
     # ------------------------------------------------------------------
-    # 3) Contract degree-2 chains, then find cycles generically
+    # 3) Contract degree-2 chains, then find cycles
     # ------------------------------------------------------------------
     def other_node(edge_idx, node):
         e = edges[edge_idx]
@@ -856,40 +593,33 @@ def detect_patterns(page,
         """Follow unique degree-2 continuation; return edge list and end node."""
         chain = [start_edge]
         used_edges.add(start_edge)
-        prev = start_node
         cur = other_node(start_edge, start_node)
 
         while True:
             cands = [ei for ei in adj[cur] if ei not in used_edges]
-            # only continue automatically through degree-2 corridor
             if len(cands) != 1:
                 break
-            # also stop if node degree (all edges) != 2 and not continuing uniquely
             deg = len(adj[cur])
             if deg != 2 and len(cands) != 1:
                 break
             nxt = cands[0]
-            # style consistency along main outline
             if edges[nxt]["style"] != edges[chain[0]]["style"]:
                 break
             used_edges.add(nxt)
             chain.append(nxt)
-            prev, cur = cur, other_node(nxt, cur)
+            cur = other_node(nxt, cur)
             if cur == start_node:
                 break
         return chain, cur
 
-    # Build maximal chains starting from every unused edge
-    chains = []  # each: {edge_indices, nodes, closed, style, length, segments, path_ids}
+    chains = []
     for ei in range(len(edges)):
         if ei in used_edges:
             continue
         e = edges[ei]
-        # start from n0
         chain_edges, end_node = walk_chain(ei, e["n0"])
         start_node = e["n0"]
 
-        # reconstruct node sequence
         nodes = [start_node]
         cur = start_node
         segs = []
@@ -904,11 +634,6 @@ def detect_patterns(page,
             nodes.append(cur)
 
         closed = (nodes[0] == nodes[-1] and len(chain_edges) >= 1)
-        # near-close single chain
-        if not closed and len(nodes) >= 2:
-            # map node -> sample xy
-            # use average of constituent terminal xys
-            pass
 
         chains.append({
             "edge_indices": chain_edges,
@@ -922,9 +647,8 @@ def detect_patterns(page,
             "end_node": nodes[-1],
         })
 
-    # Build chain-graph at junction nodes for multi-chain cycles
-    # A "chain edge" connects start_node -- end_node if not already closed
-    chain_adj = defaultdict(list)  # node -> list of chain_idx
+    # Chain graph for multi-chain cycles
+    chain_adj = defaultdict(list)
     for ci, ch in enumerate(chains):
         if ch["closed"]:
             continue
@@ -935,18 +659,12 @@ def detect_patterns(page,
         ch = chains[ci]
         return ch["end_node"] if ch["start_node"] == node else ch["start_node"]
 
-    # Enumerate simple cycles over chains (generic N-chain)
     cycle_closed = []
-    # include already-closed contracted chains
+
+    # Already-closed contracted chains
     for ch in chains:
         if not ch["closed"]:
             continue
-        # near-area
-        pts = []
-        for a, b in ch["segments"]:
-            pts.append(a)
-            pts.append(b)
-        # better ordered points:
         pts = _ordered_points_from_segments(ch["segments"], dist)
         area = poly_area(pts) if len(pts) >= 3 else 0.0
         cycle_closed.append({
@@ -957,10 +675,8 @@ def detect_patterns(page,
             "bbox": bbox_of_segs(ch["segments"]),
             "style": ch["style"],
             "closed": True,
+            "points": pts,
         })
-
-    # DFS cycles among open chains
-    used_chain_in_cycle = set()
 
     def points_for_chain_sequence(chain_idxs):
         segs = []
@@ -976,14 +692,15 @@ def detect_patterns(page,
         area = poly_area(pts) if len(pts) >= 3 else 0.0
         return segs, pids, length, area, style, pts
 
-    # For each open chain, try to find a return cycle
+    used_chain_in_cycle = set()
+
+    # DFS cycles among open chains
     for start_ci, ch0 in enumerate(chains):
         if ch0["closed"]:
             continue
         if start_ci in used_chain_in_cycle:
             continue
         start = ch0["start_node"]
-        # DFS: state = (node, path_chains, visited_chains)
         stack = [(ch0["end_node"], [start_ci], {start_ci})]
         found = None
         while stack:
@@ -991,7 +708,7 @@ def detect_patterns(page,
             if node == start and len(path_c) >= 2:
                 found = path_c
                 break
-            if len(path_c) > 80:  # safety
+            if len(path_c) > 80:
                 continue
             for nci in chain_adj.get(node, []):
                 if nci in vis:
@@ -1001,8 +718,6 @@ def detect_patterns(page,
                 nnode = chain_other(nci, node)
                 stack.append((nnode, path_c + [nci], vis | {nci}))
         if not found:
-            # also near-cycle: ends within gap after one chain
-            # handled below
             continue
 
         segs, pids, length, area, style, pts = points_for_chain_sequence(found)
@@ -1015,6 +730,7 @@ def detect_patterns(page,
                 "bbox": bbox_of_segs(segs),
                 "style": style,
                 "closed": True,
+                "points": pts,
             })
             used_chain_in_cycle.update(found)
 
@@ -1044,6 +760,7 @@ def detect_patterns(page,
                 "bbox": bbox_of_segs(ch["segments"]),
                 "style": ch["style"],
                 "closed": True,
+                "points": pts,
             })
             used_chain_in_cycle.add(ci)
 
@@ -1054,218 +771,27 @@ def detect_patterns(page,
         c for c in cycle_closed
         if c["length"] >= min_perimeter and c["area"] >= min_polygon_area
     ]
-    # dedupe by path set
     mains = _dedupe_cycles(mains)
     mains.sort(key=lambda c: c["area"], reverse=True)
 
-    main_path_ids = set()
-    for m in mains:
-        main_path_ids.update(m["path_ids"])
-
-    # Leftover open chains not used in mains
-    leftovers = []
-    for ci, ch in enumerate(chains):
-        if ci in used_chain_in_cycle and set(ch["path_ids"]).issubset(main_path_ids):
-            continue
-        if set(ch["path_ids"]) & main_path_ids == set(ch["path_ids"]) and ch["path_ids"]:
-            continue
-        if not ch["path_ids"]:
-            continue
-        # skip if fully consumed by a main
-        if ch["path_ids"] and set(ch["path_ids"]).issubset(main_path_ids):
-            continue
-        leftovers.append(ch)
-
-    # ------------------------------------------------------------------
-    # 5) Attach length options
-    #    Options must be endpoint-connected chains (not style bags).
-    # ------------------------------------------------------------------
-
-    def inside_bbox(segs, bbox, pad=30.0):
-        x0, y0, x1, y1 = bbox
-        pts = [p for s in segs for p in s]
-        if not pts:
-            return False
-        ok = sum(
-            1 for p in pts
-            if x0 - pad <= p[0] <= x1 + pad and y0 - pad <= p[1] <= y1 + pad
-        )
-        return ok >= 0.6 * len(pts)
-
-    def chain_extent(segs):
-        if not segs:
-            return 0.0
-        xs = [p[0] for s in segs for p in s]
-        ys = [p[1] for s in segs for p in s]
-        return max(max(xs) - min(xs), max(ys) - min(ys))
-
-    # Flatten leftover paths to path-level records with terminals
-    # (reuse original path terminals when possible)
-    id_to_path = {p["id"]: p for p in paths}
-
-    def leftover_path_records(ch):
-        """Expand a leftover chain into individual path records."""
-        recs = []
-        for pid in ch["path_ids"]:
-            p = id_to_path.get(pid)
-            if p is None:
-                continue
-            recs.append(p)
-        return recs
-
-    def connect_paths_into_components(path_recs, gap):
-        """
-        Same-style endpoint connection → connected components.
-        Returns list of components, each = list of path records.
-        """
-        if not path_recs:
-            return []
-
-        # only connect within identical style
-        by_style = defaultdict(list)
-        for i, p in enumerate(path_recs):
-            by_style[(p["color"], p["width"])].append(i)
-
-        components = []
-        for style, idxs in by_style.items():
-            parent = {i: i for i in idxs}
-
-            def find(x):
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-
-            def union(a, b):
-                ra, rb = find(a), find(b)
-                if ra != rb:
-                    parent[rb] = ra
-
-            # endpoint proximity among this style only
-            terms = []  # (local_idx, xy)
-            for i in idxs:
-                p = path_recs[i]
-                terms.append((i, p["t0"]))
-                terms.append((i, p["t1"]))
-
-            cell = max(gap * 1.5, 4.0)
-            grid = defaultdict(list)
-            for ti, (i, xy) in enumerate(terms):
-                grid[(int(xy[0] // cell), int(xy[1] // cell))].append(ti)
-
-            neigh = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
-            for ti, (i, xy) in enumerate(terms):
-                cx, cy = int(xy[0] // cell), int(xy[1] // cell)
-                for dx, dy in neigh:
-                    for tj in grid.get((cx + dx, cy + dy), []):
-                        if tj <= ti:
-                            continue
-                        j, xy2 = terms[tj]
-                        if i == j:
-                            continue
-                        if dist(xy, xy2) > gap:
-                            continue
-                        # only join if it actually extends the geometry
-                        if not should_join(path_recs[i], path_recs[j], gap):
-                            continue                        
-                        union(i, j)
-
-            groups = defaultdict(list)
-            for i in idxs:
-                groups[find(i)].append(path_recs[i])
-            components.extend(groups.values())
-
-        return components
-
     pieces = []
-    used_path_ids = set()
-
     for m in mains:
-        # Candidate leftovers near this main
-        candidate_paths = []
-        seen_pid = set()
-        for ch in leftovers:
-            if not ch["path_ids"]:
-                continue
-            if set(ch["path_ids"]) & set(m["path_ids"]):
-                continue
-            if not inside_bbox(ch["segments"], m["bbox"]) and not attaches(ch["segments"], m["segments"]):
-                continue
-            for p in leftover_path_records(ch):
-                if p["id"] in seen_pid or p["id"] in used_path_ids:
-                    continue
-                if p["id"] in set(m["path_ids"]):
-                    continue
-                seen_pid.add(p["id"])
-                candidate_paths.append(p)
-
-        # CRITICAL: connect by endpoints, not by style bag
-        comps = connect_paths_into_components(candidate_paths, gap_threshold)
-
-        variants = []
-        main_style = m["style"]
-
-        for comp in comps:
-            segs = []
-            pids = []
-            length = 0.0
-            for p in comp:
-                segs.extend(p["segments"])
-                pids.append(p["id"])
-                length += p["length"]
-
-            if not segs:
-                continue
-
-            style = (comp[0]["color"], comp[0]["width"])
-            extent = chain_extent(segs)
-
-            if length < min_option_length:
-                continue
-            if extent < min_option_length * 0.5:
-                continue
-
-            # Must touch the main outline
-            if not attaches(segs, m["segments"]):
-                continue
-
-            chord = attachment_chord(segs, m["segments"])
-            if length > 1.8 * chord:               # dart filter                              
-                continue
-
-            # main_w = m["bbox"][2] - m["bbox"][0]
-            # main_h = m["bbox"][3] - m["bbox"][1]
-            
-            # # Reject tiny base even if the ratio is ok (very small darts / notches)
-            # if chord < 0.08 * max(main_w, main_h):   # or 0.12 * min(...)
-            #     continue
-
-            variants.append({
-                "segments": segs,
-                "path_ids": sorted(set(pids)),
-                "length": length,
-                "color": style[0],
-                "width": style[1],
-            })
-            used_path_ids.update(pids)
-
-        variants = deduplicate_variants(variants, tol=8.0)   # 5–15 works well
-        variants.sort(key=lambda v: v["length"], reverse=True)
-
         pieces.append({
             "segments": m["segments"],
+            "points": m.get("points") or _ordered_points_from_segments(m["segments"], dist),
             "bbox": m["bbox"],
             "area": m["area"],
             "perimeter": m["length"],
             "path_ids": list(dict.fromkeys(m["path_ids"])),
-            "size_variants": variants,
             "closed": True,
+            "style": m.get("style"),
+            # kept empty for backward compatibility with any code that still looks for it
+            "size_variants": [],
         })
 
     print(f"Pattern pieces kept: {len(pieces)}")
     for i, p in enumerate(pieces):
-        print(f"  [{i}] paths={len(p['path_ids'])} options={len(p['size_variants'])} "
-              f"area={p['area']:.0f}")
+        print(f"  [{i}] paths={len(p['path_ids'])} area={p['area']:.0f}")
     return pieces
 
 
@@ -1742,7 +1268,7 @@ def detect_special_lines(page,
 def write_patterns_txt(pieces, out_path: Path):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"# Pattern pieces: {len(pieces)}\n")
-        f.write("# Goal 2 format: main outline + size/length options\n\n")
+        f.write("# Main outline only (user selects sections interactively)\n\n")
 
         for i, p in enumerate(pieces):
             f.write(f"PIECE {i}\n")
@@ -1755,16 +1281,12 @@ def write_patterns_txt(pieces, out_path: Path):
             for s in p.get("segments", []):
                 f.write(f"    {s[0]} -> {s[1]}\n")
 
-            variants = p.get("size_variants", []) or []
-            f.write(f"  options   : {len(variants)}\n")
-            for vi, v in enumerate(variants):
-                f.write(f"    OPTION {vi}\n")
-                f.write(f"      length   : {v.get('length', 0.0):.1f}\n")
-                f.write(f"      color    : {v.get('color')}\n")
-                f.write(f"      path_ids : {v.get('path_ids', [])}\n")
-                f.write(f"      segments : {len(v.get('segments', []))}\n")
-                for s in v.get("segments", []):
-                    f.write(f"        {s[0]} -> {s[1]}\n")
+            # ordered points (useful for interactive selection later)
+            pts = p.get("points") or []
+            if pts:
+                f.write(f"  points    : {len(pts)}\n")
+                for pt in pts:
+                    f.write(f"    {pt}\n")
 
             f.write("\n")
 
@@ -1865,32 +1387,6 @@ def render(page, objects, mode, out_path: Path, assembled=None):
                 )
                 ax.add_collection(lc)
 
-            # Length options
-            for vi, variant in enumerate(piece.get("size_variants", []) or []):
-                segs = variant.get("segments") or []
-                if not segs:
-                    continue
-                lc = LineCollection(
-                    segs,
-                    colors=["orange"],
-                    linewidths=2.2,
-                    alpha=0.9,
-                    zorder=4,
-                )
-                ax.add_collection(lc)
-
-                (x1, y1), (x2, y2) = segs[0]
-                ax.text(
-                    (x1 + x2) / 2,
-                    (y1 + y2) / 2,
-                    f"{i}.L{vi}",
-                    color="darkorange",
-                    fontsize=8,
-                    fontweight="bold",
-                    bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1),
-                    zorder=5,
-                )
-
             # Bounding box + index
             x0, y0, x1, y1 = piece["bbox"]
             rect = Rectangle(
@@ -1916,10 +1412,10 @@ def render(page, objects, mode, out_path: Path, assembled=None):
                 zorder=6,
             )
 
-        # Legend
+        # Legend (simplified)
         ax.text(
             0.02, 0.02,
-            "Solid coloured = main outline\nOrange = length options",
+            "Solid coloured = main outline",
             transform=ax.transAxes,
             fontsize=8,
             verticalalignment="bottom",
@@ -2059,8 +1555,6 @@ if __name__ == "__main__":
 
 
 # TODO:
-# Add support for pattern pieces spanning 2 (Or more than 1) pages.
-# Main issue currently with itch pattern, and a length option (lining/main fabric seperation is ignored)
-# Seems like the issue is due to the paths joining only at their endpoints and the lining vertical line joins the horizontal segment in the middle.
-
-# Also, may need to increase gap_threshold, missing some pattern pieces. Fine tune and perform regression tests.
+# Choosing length/lining options inside the main pattern outline is too complicated...
+# Let user choose area of pattern outline.
+# Assume main outline was chosen, and user can choose areas to mark/unmark.
