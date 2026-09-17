@@ -1576,6 +1576,182 @@ def render_faces(page, faces_per_piece, out_path: Path, assembled=None):
 # REGION / FACE DETECTION (Shapely)
 # ------------------------------------------------------------------
 
+# ------------------------------------------------------------------
+# INTERACTIVE FACE SELECTOR
+# ------------------------------------------------------------------
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.collections import PatchCollection
+import numpy as np
+
+class FaceSelector:
+    def __init__(self, page, faces_per_piece, assembled=None, title="Select faces – click to toggle"):
+        self.faces_per_piece = faces_per_piece
+        self.selected = set()          # set of (piece_idx, face_idx)
+        self.done = False
+        self.cancelled = False
+
+        # Flatten for easy hit-testing
+        self.flat_faces = []           # list of (piece_idx, face_idx, face_dict)
+        for pi, faces in faces_per_piece:
+            for fi, face in enumerate(faces):
+                self.flat_faces.append((pi, fi, face))
+
+        # ---- figure setup (mirrors render_faces) ----
+        if assembled is not None:
+            global_rect = assembled["global_rect"]
+            fig_w = 16
+            fig_h = max(8.0, fig_w * global_rect.height / max(global_rect.width, 1.0))
+            self.fig, self.ax = plt.subplots(figsize=(fig_w, fig_h))
+            self.ax.set_xlim(global_rect.x0 - 10, global_rect.x1 + 10)
+            self.ax.set_ylim(global_rect.y1 + 10, global_rect.y0 - 10)
+        else:
+            page_rect = page.rect
+            self.fig, self.ax = plt.subplots(figsize=(12, 12 * page_rect.height / page_rect.width))
+            self.ax.set_xlim(page_rect.x0, page_rect.x1)
+            self.ax.set_ylim(page_rect.y1, page_rect.y0)
+
+            # faint background
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            self.ax.imshow(
+                img,
+                extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
+                alpha=0.35,
+                zorder=0,
+            )
+
+        self.ax.set_aspect("equal")
+        self.ax.axis("off")
+        self.ax.set_title(title)
+
+        self.colors = plt.cm.tab20.colors
+        self.patches = []              # list of MplPolygon
+        self._draw_faces()
+
+        # status text
+        self.status = self.ax.text(
+            0.02, 0.98,
+            self._status_text(),
+            transform=self.ax.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=4),
+            zorder=10,
+        )
+
+        # events
+        self.cid_click = self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+        self.cid_key   = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+
+    def _status_text(self):
+        n = len(self.selected)
+        total = len(self.flat_faces)
+        return f"Selected: {n} / {total}   |  click = toggle   Enter/d = done   a = all   c = clear   Esc = cancel"
+
+    def _draw_faces(self):
+        # remove old patches
+        for p in self.patches:
+            p.remove()
+        self.patches.clear()
+
+        for idx, (pi, fi, face) in enumerate(self.flat_faces):
+            is_sel = (pi, fi) in self.selected
+            color = self.colors[idx % len(self.colors)]
+
+            poly = MplPolygon(
+                face["points"],
+                closed=True,
+                facecolor=color,
+                edgecolor="black" if is_sel else "grey",
+                linewidth=2.8 if is_sel else 1.0,
+                alpha=0.70 if is_sel else 0.30,
+                zorder=3 if is_sel else 2,
+            )
+            self.ax.add_patch(poly)
+            self.patches.append(poly)
+
+            # label
+            cx = sum(p[0] for p in face["points"]) / len(face["points"])
+            cy = sum(p[1] for p in face["points"]) / len(face["points"])
+            self.ax.text(
+                cx, cy, f"{pi}.{fi}",
+                color="black", fontsize=8, fontweight="bold",
+                ha="center", va="center",
+                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1),
+                zorder=5,
+            )
+
+        self.fig.canvas.draw_idle()
+
+    def _on_click(self, event):
+        if event.inaxes != self.ax or event.button != 1:
+            return
+        x, y = event.xdata, event.ydata
+        if x is None or y is None:
+            return
+
+        # hit-test against faces (last drawn = top-most, so reverse)
+        from shapely.geometry import Point
+        pt = Point(x, y)
+        for pi, fi, face in reversed(self.flat_faces):
+            if face["polygon"].contains(pt) or face["polygon"].touches(pt):
+                key = (pi, fi)
+                if key in self.selected:
+                    self.selected.remove(key)
+                else:
+                    self.selected.add(key)
+                self._draw_faces()
+                self.status.set_text(self._status_text())
+                self.fig.canvas.draw_idle()
+                return
+
+    def _on_key(self, event):
+        if event.key in ("enter", "d"):
+            self.done = True
+            plt.close(self.fig)
+        elif event.key == "escape":
+            self.cancelled = True
+            self.selected.clear()
+            plt.close(self.fig)
+        elif event.key == "a":
+            self.selected = {(pi, fi) for pi, fi, _ in self.flat_faces}
+            self._draw_faces()
+            self.status.set_text(self._status_text())
+            self.fig.canvas.draw_idle()
+        elif event.key == "c":
+            self.selected.clear()
+            self._draw_faces()
+            self.status.set_text(self._status_text())
+            self.fig.canvas.draw_idle()
+
+    def run(self):
+        """Block until the user finishes. Returns list of selected face dicts."""
+        plt.show(block=True)
+
+        if self.cancelled:
+            return []
+
+        selected_faces = []
+        for pi, fi, face in self.flat_faces:
+            if (pi, fi) in self.selected:
+                # attach provenance
+                face = dict(face)          # shallow copy
+                face["source_piece"] = pi
+                face["face_index"] = fi
+                selected_faces.append(face)
+        return selected_faces
+
+
+def select_faces_interactive(page, faces_per_piece, assembled=None):
+    """
+    Convenience wrapper.
+    Opens an interactive window and returns the list of faces the user selected.
+    """
+    selector = FaceSelector(page, faces_per_piece, assembled=assembled)
+    return selector.run()
+
+
 def _extend_line(ls, factor=1.6):
     """Extend a LineString beyond its endpoints so it is guaranteed to cross a surrounding boundary."""
     coords = list(ls.coords)
@@ -1832,6 +2008,28 @@ def main():
         out_dir / f"{stem}_faces.png",
         assembled=assembled_pat,
     )
+
+    # ------------------------------------------------------------------
+    # Interactive selection
+    # ------------------------------------------------------------------
+    print("\n=== Interactive face selection ===")
+    print("Click faces to toggle.  Enter/d = done, a = all, c = clear, Esc = cancel")
+
+    selected = select_faces_interactive(
+        assembled_page_pat,
+        faces_per_piece,
+        assembled=assembled_pat,
+    )
+
+    print(f"User selected {len(selected)} face(s)")
+    for i, f in enumerate(selected):
+        print(f"  [{i}] piece={f['source_piece']}  face={f['face_index']}  "
+              f"area={f['area']:.0f}")
+
+    # optional: write the chosen faces
+    if selected:
+        write_patterns_txt(selected, out_dir / f"{stem}_selected_faces.txt")
+        # you can also render only the selected ones if you want
 
 
     pattern_doc.close()
