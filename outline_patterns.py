@@ -26,9 +26,11 @@ from pathlib import Path
 from collections import defaultdict, Counter
 import fitz
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Rectangle
+from matplotlib.patches import Polygon as MplPolygon
 
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split
@@ -1541,7 +1543,6 @@ def render_faces(page, faces_per_piece, out_path: Path, assembled=None):
             face_id += 1
 
             # filled region
-            from matplotlib.patches import Polygon as MplPolygon
             poly = MplPolygon(
                 face["points"],
                 closed=True,
@@ -1554,18 +1555,18 @@ def render_faces(page, faces_per_piece, out_path: Path, assembled=None):
             ax.add_patch(poly)
 
             # label
-            cx = sum(p[0] for p in face["points"]) / len(face["points"])
-            cy = sum(p[1] for p in face["points"]) / len(face["points"])
-            ax.text(
-                cx, cy,
-                f"{piece_idx}.{fi}",
-                color="black",
-                fontsize=9,
-                fontweight="bold",
-                ha="center", va="center",
-                bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1),
-                zorder=5,
-            )
+            # cx = sum(p[0] for p in face["points"]) / len(face["points"])
+            # cy = sum(p[1] for p in face["points"]) / len(face["points"])
+            # ax.text(
+            #     cx, cy,
+            #     f"{piece_idx}.{fi}",
+            #     color="black",
+            #     fontsize=9,
+            #     fontweight="bold",
+            #     ha="center", va="center",
+            #     bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1),
+            #     zorder=5,
+            # )
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1573,31 +1574,36 @@ def render_faces(page, faces_per_piece, out_path: Path, assembled=None):
     print(f"Saved faces PNG → {out_path}")
 
 # ------------------------------------------------------------------
-# REGION / FACE DETECTION (Shapely)
+# INTERACTIVE FACE SELECTOR  (v2 – faster, per-piece colours, start selected)
 # ------------------------------------------------------------------
-
-# ------------------------------------------------------------------
-# INTERACTIVE FACE SELECTOR
-# ------------------------------------------------------------------
-import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon as MplPolygon
-from matplotlib.collections import PatchCollection
-import numpy as np
 
 class FaceSelector:
-    def __init__(self, page, faces_per_piece, assembled=None, title="Select faces – click to toggle"):
+    def __init__(self, page, faces_per_piece, assembled=None,
+                 title="Select faces – click to toggle"):
         self.faces_per_piece = faces_per_piece
-        self.selected = set()          # set of (piece_idx, face_idx)
         self.done = False
         self.cancelled = False
 
-        # Flatten for easy hit-testing
-        self.flat_faces = []           # list of (piece_idx, face_idx, face_dict)
+        # Flatten
+        self.flat_faces = []          # (piece_idx, face_idx, face_dict)
         for pi, faces in faces_per_piece:
             for fi, face in enumerate(faces):
                 self.flat_faces.append((pi, fi, face))
 
-        # ---- figure setup (mirrors render_faces) ----
+        # Start with EVERYTHING selected
+        self.selected = {(pi, fi) for pi, fi, _ in self.flat_faces}
+
+        # One stable colour per pattern piece
+        n_pieces = max((pi for pi, _, _ in self.flat_faces), default=0) + 1
+        try:
+            # Matplotlib ≥ 3.7
+            cmap = mpl.colormaps["tab20"]
+        except (AttributeError, KeyError):
+            # Fallback for older versions
+            cmap = plt.cm.get_cmap("tab20")
+
+        self.piece_colors = {pi: cmap(pi % 20) for pi in range(max(n_pieces, 1))}
+        # ---- figure ----
         if assembled is not None:
             global_rect = assembled["global_rect"]
             fig_w = 16
@@ -1607,13 +1613,16 @@ class FaceSelector:
             self.ax.set_ylim(global_rect.y1 + 10, global_rect.y0 - 10)
         else:
             page_rect = page.rect
-            self.fig, self.ax = plt.subplots(figsize=(12, 12 * page_rect.height / page_rect.width))
+            self.fig, self.ax = plt.subplots(
+                figsize=(12, 12 * page_rect.height / page_rect.width)
+            )
             self.ax.set_xlim(page_rect.x0, page_rect.x1)
             self.ax.set_ylim(page_rect.y1, page_rect.y0)
 
-            # faint background
             pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height, pix.width, 3
+            )
             self.ax.imshow(
                 img,
                 extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
@@ -1623,66 +1632,162 @@ class FaceSelector:
 
         self.ax.set_aspect("equal")
         self.ax.axis("off")
-        self.ax.set_title(title)
 
-        self.colors = plt.cm.tab20.colors
-        self.patches = []              # list of MplPolygon
-        self._draw_faces()
+        # Title higher up and smaller so it doesn’t cover content
+        self.ax.set_title(title, pad=2, fontsize=11)
 
-        # status text
-        self.status = self.ax.text(
-            0.02, 0.98,
-            self._status_text(),
-            transform=self.ax.transAxes,
-            fontsize=10,
-            verticalalignment="top",
-            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=4),
-            zorder=10,
-        )
+        # Create patches ONCE
+        self.patches = {}          # (pi, fi) → MplPolygon
+        self.labels  = {}          # (pi, fi) → text artist
 
-        # events
-        self.cid_click = self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-        self.cid_key   = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        # artists that show the combined outline of each piece
+        self.combined_outlines = {}   # piece_idx → LineCollection or list of plots
 
-    def _status_text(self):
-        n = len(self.selected)
-        total = len(self.flat_faces)
-        return f"Selected: {n} / {total}   |  click = toggle   Enter/d = done   a = all   c = clear   Esc = cancel"
+        # After creating the face patches, draw the initial combined outlines
+        self._update_all_combined_outlines()        
 
-    def _draw_faces(self):
-        # remove old patches
-        for p in self.patches:
-            p.remove()
-        self.patches.clear()
-
-        for idx, (pi, fi, face) in enumerate(self.flat_faces):
-            is_sel = (pi, fi) in self.selected
-            color = self.colors[idx % len(self.colors)]
+        for pi, fi, face in self.flat_faces:
+            color = self.piece_colors[pi]
 
             poly = MplPolygon(
                 face["points"],
                 closed=True,
                 facecolor=color,
-                edgecolor="black" if is_sel else "grey",
-                linewidth=2.8 if is_sel else 1.0,
-                alpha=0.70 if is_sel else 0.30,
-                zorder=3 if is_sel else 2,
+                edgecolor="0.45",      # same as _update_face_style
+                linewidth=0.7,         # same as selected state
+                alpha=0.62,            # same as selected state
+                zorder=3,
+                picker=False,
             )
             self.ax.add_patch(poly)
-            self.patches.append(poly)
+            self.patches[(pi, fi)] = poly
 
-            # label
-            cx = sum(p[0] for p in face["points"]) / len(face["points"])
-            cy = sum(p[1] for p in face["points"]) / len(face["points"])
-            self.ax.text(
-                cx, cy, f"{pi}.{fi}",
-                color="black", fontsize=8, fontweight="bold",
-                ha="center", va="center",
-                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1),
-                zorder=5,
-            )
+            # # label
+            # cx = sum(p[0] for p in face["points"]) / len(face["points"])
+            # cy = sum(p[1] for p in face["points"]) / len(face["points"])
+            # txt = self.ax.text(
+            #     cx, cy, f"{pi}.{fi}",
+            #     color="black", fontsize=8, fontweight="bold",
+            #     ha="center", va="center",
+            #     bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1),
+            #     zorder=5,
+            # )
+            # self.labels[(pi, fi)] = txt
 
-        self.fig.canvas.draw_idle()
+        # Make sure every face starts with the correct visual style
+        for pi, fi, _ in self.flat_faces:
+            self._update_face_style(pi, fi)
+
+        # Then draw the combined outlines
+        self._update_all_combined_outlines()
+
+        # Status bar – placed very high and compact
+        self.status = self.ax.text(
+            0.01, 0.995,
+            self._status_text(),
+            transform=self.ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            horizontalalignment="left",
+            bbox=dict(facecolor="white", alpha=0.88, edgecolor="none", pad=3),
+            zorder=10,
+        )
+
+        # events
+        self.cid_click = self.fig.canvas.mpl_connect(
+            "button_press_event", self._on_click
+        )
+        self.cid_key = self.fig.canvas.mpl_connect(
+            "key_press_event", self._on_key
+        )
+
+        # Make layout tighter
+        self.fig.tight_layout(pad=0.4)
+        self.fig.subplots_adjust(top=0.96)   # push title up
+
+    def _update_all_combined_outlines(self):
+        piece_ids = {pi for pi, _, _ in self.flat_faces}
+        for pi in piece_ids:
+            self._update_combined_outline(pi)
+
+    def _compute_combined_polygon(self, piece_idx):
+        """Return the unary union of all currently selected faces of this piece."""
+        from shapely.ops import unary_union
+        polys = []
+        for pi, fi, face in self.flat_faces:
+            if pi == piece_idx and (pi, fi) in self.selected:
+                polys.append(face["polygon"])
+        if not polys:
+            return None
+        try:
+            u = unary_union(polys)
+            if u.is_empty:
+                return None
+            if u.geom_type == "MultiPolygon":
+                # take the largest part (usually there is only one)
+                u = max(u.geoms, key=lambda g: g.area)
+            return u if u.geom_type == "Polygon" else None
+        except Exception:
+            return None
+        
+    def _update_combined_outline(self, piece_idx):
+        """Strong, unmistakable main outline."""
+        # remove previous
+        if piece_idx in self.combined_outlines:
+            arts = self.combined_outlines[piece_idx]
+            if not isinstance(arts, (list, tuple)):
+                arts = [arts]
+            for a in arts:
+                a.remove()
+            del self.combined_outlines[piece_idx]
+
+        poly = self._compute_combined_polygon(piece_idx)
+        if poly is None or poly.exterior is None:
+            return
+
+        coords = list(poly.exterior.coords)
+        xs, ys = zip(*coords)
+
+        # soft glow underneath
+        glow, = self.ax.plot(
+            xs, ys,
+            color="white",
+            linewidth=7.0,
+            solid_capstyle="round",
+            solid_joinstyle="round",
+            alpha=0.45,
+            zorder=6,
+        )
+        # crisp dark core on top
+        core, = self.ax.plot(
+            xs, ys,
+            color="black",
+            linewidth=3.0,
+            solid_capstyle="round",
+            solid_joinstyle="round",
+            alpha=0.95,
+            zorder=7,
+        )
+        self.combined_outlines[piece_idx] = [glow, core]
+
+
+    def _status_text(self):
+        n = len(self.selected)
+        total = len(self.flat_faces)
+        return (f"Selected: {n}/{total}   "
+                f"click=toggle   Enter/d=done   a=all   c=clear   Esc=cancel")
+
+    def _update_face_style(self, pi, fi):
+        """Face edges stay subtle."""
+        poly = self.patches[(pi, fi)]
+        is_sel = (pi, fi) in self.selected
+        color = self.piece_colors[pi]
+
+        poly.set_facecolor(color)
+        poly.set_edgecolor("0.45")          # medium-light grey
+        poly.set_linewidth(0.7 if is_sel else 0.5)
+        poly.set_alpha(0.62 if is_sel else 0.18)
+        poly.set_zorder(3 if is_sel else 2)
 
     def _on_click(self, event):
         if event.inaxes != self.ax or event.button != 1:
@@ -1691,8 +1796,6 @@ class FaceSelector:
         if x is None or y is None:
             return
 
-        # hit-test against faces (last drawn = top-most, so reverse)
-        from shapely.geometry import Point
         pt = Point(x, y)
         for pi, fi, face in reversed(self.flat_faces):
             if face["polygon"].contains(pt) or face["polygon"].touches(pt):
@@ -1701,7 +1804,11 @@ class FaceSelector:
                     self.selected.remove(key)
                 else:
                     self.selected.add(key)
-                self._draw_faces()
+
+                # update only the face that changed + its piece outline
+                self._update_face_style(pi, fi)
+                self._update_combined_outline(pi)
+
                 self.status.set_text(self._status_text())
                 self.fig.canvas.draw_idle()
                 return
@@ -1716,38 +1823,66 @@ class FaceSelector:
             plt.close(self.fig)
         elif event.key == "a":
             self.selected = {(pi, fi) for pi, fi, _ in self.flat_faces}
-            self._draw_faces()
+            for pi, fi, _ in self.flat_faces:
+                self._update_face_style(pi, fi)
+            self._update_all_combined_outlines()
             self.status.set_text(self._status_text())
             self.fig.canvas.draw_idle()
         elif event.key == "c":
             self.selected.clear()
-            self._draw_faces()
+            for pi, fi, _ in self.flat_faces:
+                self._update_face_style(pi, fi)
+            self._update_all_combined_outlines()
             self.status.set_text(self._status_text())
             self.fig.canvas.draw_idle()
 
     def run(self):
-        """Block until the user finishes. Returns list of selected face dicts."""
         plt.show(block=True)
 
         if self.cancelled:
             return []
 
-        selected_faces = []
+        # ---- build the final combined outlines (what you actually want) ----
+        from collections import defaultdict
+        from shapely.ops import unary_union
+
+        by_piece = defaultdict(list)
         for pi, fi, face in self.flat_faces:
             if (pi, fi) in self.selected:
-                # attach provenance
-                face = dict(face)          # shallow copy
-                face["source_piece"] = pi
-                face["face_index"] = fi
-                selected_faces.append(face)
-        return selected_faces
+                by_piece[pi].append(face["polygon"])
+
+        result = []
+        for pi, polys in sorted(by_piece.items()):
+            try:
+                u = unary_union(polys)
+                if u.is_empty:
+                    continue
+                if u.geom_type == "MultiPolygon":
+                    u = max(u.geoms, key=lambda g: g.area)
+                if u.geom_type != "Polygon" or u.exterior is None:
+                    continue
+
+                coords = list(u.exterior.coords)
+                segs = [(coords[i], coords[i+1]) for i in range(len(coords)-1)]
+                result.append({
+                    "segments": segs,
+                    "points": coords[:-1],
+                    "area": float(u.area),
+                    "bbox": u.bounds,
+                    "source_piece": pi,
+                    "closed": True,
+                    # keep empty for compatibility with write_patterns_txt / render
+                    "size_variants": [],
+                    "path_ids": [],          # no longer meaningful
+                    "perimeter": float(u.length),
+                })
+            except Exception:
+                continue
+
+        return result
 
 
 def select_faces_interactive(page, faces_per_piece, assembled=None):
-    """
-    Convenience wrapper.
-    Opens an interactive window and returns the list of faces the user selected.
-    """
     selector = FaceSelector(page, faces_per_piece, assembled=assembled)
     return selector.run()
 
