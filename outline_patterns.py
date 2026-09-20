@@ -55,60 +55,6 @@ class AssembledPage:
 def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
-
-def _ordered_points_from_segments(segs, dist_fn=None):
-    """
-    Turn an unordered list of segments into an ordered point list
-    that walks the chain as well as possible.
-    """
-    if not segs:
-        return []
-
-    if dist_fn is None:
-        def dist_fn(a, b):
-            return math.hypot(a[0]-b[0], a[1]-b[1])
-
-    from collections import defaultdict
-
-    def key(p):
-        return (round(p[0], 3), round(p[1], 3))
-
-    adj = defaultdict(list)
-    pts = {}
-    for a, b in segs:
-        ka, kb = key(a), key(b)
-        pts[ka] = a
-        pts[kb] = b
-        adj[ka].append(kb)
-        adj[kb].append(ka)
-
-    # Start from a degree-1 node if possible, otherwise any node
-    start = None
-    for k, nbrs in adj.items():
-        if len(set(nbrs)) == 1:
-            start = k
-            break
-    if start is None:
-        start = next(iter(adj))
-
-    ordered = []
-    visited = set()
-    cur = start
-    prev = None
-
-    while cur is not None and cur not in visited:
-        visited.add(cur)
-        ordered.append(pts[cur])
-        candidates = [n for n in adj[cur] if n != prev]
-        # Prefer unvisited
-        candidates = [n for n in candidates if n not in visited] or candidates
-        if not candidates:
-            break
-        # Take the first (or the one that continues the direction – simple version)
-        prev, cur = cur, candidates[0]
-
-    return ordered
-
 def path_to_segments(path):
     segments = []
     for item in path.get("items", []):
@@ -854,6 +800,18 @@ def detect_patterns(page,
         print(f"  [{i}] paths={len(p['path_ids'])} area={p['area']:.0f}")
     return pieces
 
+def _ordered_points_from_segments(segs, dist_fn):
+    if not segs:
+        return []
+    pts = [segs[0][0], segs[0][1]]
+    for a, b in segs[1:]:
+        if dist_fn(pts[-1], a) <= dist_fn(pts[-1], b):
+            pts.append(b)
+        else:
+            pts.append(a)
+    return pts
+
+
 def _dedupe_cycles(cycles):
     out = []
     seen = []
@@ -863,13 +821,11 @@ def _dedupe_cycles(cycles):
             continue
         dup = False
         for s in seen:
-            # if heavily overlapping path sets, keep larger area only
             inter = len(key & s)
             if inter and inter >= 0.8 * min(len(key), len(s)):
                 dup = True
                 break
         if dup:
-            # replace if bigger area
             for i, s in enumerate(seen):
                 inter = len(key & s)
                 if inter and inter >= 0.8 * min(len(key), len(s)):
