@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-outline_patterns_debug.py – Step 1 only
+outline_patterns_debug.py
 
+Step 1
 Read stroked paths from a PDF page and draw them exactly as they are
 (no snap, no union, no extension). Saves a PNG + a short text summary
-so you can verify the raw geometry before any later processing.
+to verify the raw geometry before any later processing.
+
+Step 2
+Perform directional extensions to verify overlapping segments to allow unary_union to work well.
+Saves a PNG + a short text summary to verify correct extension direction + length.
 
 How to run:
 python outline_patterns_debug.py --pdf /path/to/your.pdf --pages 0
@@ -22,11 +27,47 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
-
+# Helpers
 def dist(a, b):
     """Euclidean distance between two (x, y) points."""
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
+def _unit_dir(a, b):
+    """Unit vector from a → b. Returns (0,0) if degenerate."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-12:
+        return (0.0, 0.0)
+    return (dx / L, dy / L)
+
+def extend_polyline_ends(segments, extension: float):
+    """
+    Extend only the two ends of a polyline along their local direction.
+
+    segments: ordered list of ((x1,y1),(x2,y2)) forming one path.
+    extension: how far to push each free end (PDF units).
+
+    Why only the ends: internal samples of a Bezier are already connected;
+    only the path terminals need to bridge dash gaps / corner gaps.
+    """
+    if not segments or extension <= 0:
+        return list(segments)
+
+    out = [list(s) for s in segments]  # mutable copies
+
+    # --- start of path: extend backward from first segment ---
+    a, b = out[0]
+    ux, uy = _unit_dir(b, a)  # direction pointing outward at start
+    if ux != 0.0 or uy != 0.0:
+        out[0] = ((a[0] + ux * extension, a[1] + uy * extension), b)
+
+    # --- end of path: extend forward from last segment ---
+    a, b = out[-1]
+    ux, uy = _unit_dir(a, b)  # direction pointing outward at end
+    if ux != 0.0 or uy != 0.0:
+        out[-1] = (a, (b[0] + ux * extension, b[1] + uy * extension))
+
+    return [(tuple(p), tuple(q)) for p, q in out]
 
 def path_to_segments(path):
     """
@@ -177,6 +218,61 @@ def step1_read_and_draw(page, out_dir: Path, stem: str, min_segment_length: floa
 
     return records, all_segments
 
+def step2_extend_ends(records, out_dir: Path, stem: str, extension: float = 12.0):
+    """
+    Step 2: extend each path's terminal stubs along their direction.
+
+    Does NOT snap endpoints and does NOT extend internal segments.
+    Purpose: close small dash/corner gaps so later unary_union can node
+    collinear or meeting strokes without a large snap radius.
+
+    Returns
+    -------
+    extended_records : same structure as Step 1 records, segments updated
+    all_segments     : flat list of extended segments
+    """
+    extended_records = []
+    all_segments = []
+    n_extended = 0
+
+    for rec in records:
+        segs = rec["segments"]
+        if not segs:
+            continue
+        new_segs = extend_polyline_ends(segs, extension)
+        if new_segs != segs:
+            n_extended += 1
+        new_rec = dict(rec)
+        new_rec["segments"] = new_segs
+        new_rec["length"] = sum(dist(a, b) for a, b in new_segs)
+        extended_records.append(new_rec)
+        all_segments.extend(new_segs)
+
+    # --- text summary ---
+    summary_path = out_dir / f"{stem}_step2_summary.txt"
+    bbox = segments_bbox(all_segments)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("STEP 2 – directional end extension\n")
+        f.write(f"  extension length : {extension}\n")
+        f.write(f"  paths processed  : {len(extended_records)}\n")
+        f.write(f"  paths changed    : {n_extended}\n")
+        f.write(f"  segments total   : {len(all_segments)}\n")
+        f.write(f"  bbox             : {bbox}\n")
+    print(f"Step 2 summary → {summary_path}")
+
+    # --- PNG: show original (thin grey) + extended (coloured) ---
+    png_path = out_dir / f"{stem}_step2_extended.png"
+    _draw_step2_debug(
+        original_records=records,
+        extended_records=extended_records,
+        page_bbox=bbox,
+        out_path=png_path,
+        extension=extension,
+    )
+    print(f"Step 2 image   → {png_path}")
+
+    return extended_records, all_segments
+
 
 def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title: str):
     """Draw every path in a cycling colour for visual inspection."""
@@ -213,6 +309,56 @@ def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
 
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close()
+
+
+def _draw_step2_debug(original_records, extended_records, page_bbox, out_path, extension):
+    """
+    Overlay:
+      - original segments in light grey
+      - extended segments in tab20 colours
+    so you can see exactly what the extension added.
+    """
+    x0, y0, x1, y1 = page_bbox
+    # pad a bit more because ends grew
+    pad = max(extension * 2, 20.0)
+    w = max(x1 - x0, 1.0)
+    h = max(y1 - y0, 1.0)
+    fig_w = 14
+    fig_h = max(6.0, fig_w * h / w)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.set_xlim(x0 - pad, x1 + pad)
+    ax.set_ylim(y1 + pad, y0 - pad)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(f"STEP 2 – end extension (len={extension})", fontsize=11)
+
+    # originals in grey
+    orig_segs = [s for r in original_records for s in r["segments"]]
+    if orig_segs:
+        lc = LineCollection(orig_segs, colors=["0.75"], linewidths=0.8, alpha=0.7, zorder=1)
+        ax.add_collection(lc)
+
+    try:
+        cmap = plt.colormaps["tab20"]
+    except (AttributeError, KeyError):
+        cmap = plt.cm.get_cmap("tab20")
+
+    for i, rec in enumerate(extended_records):
+        segs = rec["segments"]
+        if not segs:
+            continue
+        lc = LineCollection(segs, colors=[cmap(i % 20)], linewidths=1.3, alpha=0.95, zorder=2)
+        ax.add_collection(lc)
+
+    ax.text(
+        0.01, 0.99,
+        f"grey=original  colour=extended  extension={extension}",
+        transform=ax.transAxes, fontsize=9, va="top",
+        bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
+    )
     plt.tight_layout()
     plt.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close()
@@ -258,6 +404,7 @@ def main():
         page = doc[pno]
         page_stem = f"{stem}_p{pno}"
         print(f"\n=== Page {pno} ===")
+        # ----- STEP 1 - Read and draw as is -----        
         records, all_segments = step1_read_and_draw(
             page,
             out_dir=out_dir,
@@ -265,6 +412,15 @@ def main():
             min_segment_length=args.min_seg_length,
         )
         print(f"  paths={len(records)}  segments={len(all_segments)}")
+
+        # ----- STEP 2 - Extension -----
+        ext_records, ext_segments = step2_extend_ends(
+            records,
+            out_dir=out_dir,
+            stem=page_stem,
+            extension=12.0,   # tune from typical dash gap; try 8–15
+        )
+        print(f"  step2 segments={len(ext_segments)}")        
 
     doc.close()
     print("\nDone. Check the Step 1 PNG and summary txt.")
