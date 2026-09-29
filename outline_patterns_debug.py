@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-outline_patterns_debug.py
+outline_patterns_debug.py – Step 1 + 2 only
 
-Step 1
 Read stroked paths from a PDF page and draw them exactly as they are
 (no snap, no union, no extension). Saves a PNG + a short text summary
-to verify the raw geometry before any later processing.
-
-Step 2
-Perform directional extensions to verify overlapping segments to allow unary_union to work well.
-Saves a PNG + a short text summary to verify correct extension direction + length.
+so you can verify the raw geometry before any later processing.
 
 How to run:
 python outline_patterns_debug.py --pdf /path/to/your.pdf --pages 0
@@ -40,35 +35,6 @@ def _unit_dir(a, b):
         return (0.0, 0.0)
     return (dx / L, dy / L)
 
-def extend_polyline_ends(segments, extension: float):
-    """
-    Extend only the two ends of a polyline along their local direction.
-
-    segments: ordered list of ((x1,y1),(x2,y2)) forming one path.
-    extension: how far to push each free end (PDF units).
-
-    Why only the ends: internal samples of a Bezier are already connected;
-    only the path terminals need to bridge dash gaps / corner gaps.
-    """
-    if not segments or extension <= 0:
-        return list(segments)
-
-    out = [list(s) for s in segments]  # mutable copies
-
-    # --- start of path: extend backward from first segment ---
-    a, b = out[0]
-    ux, uy = _unit_dir(b, a)  # direction pointing outward at start
-    if ux != 0.0 or uy != 0.0:
-        out[0] = ((a[0] + ux * extension, a[1] + uy * extension), b)
-
-    # --- end of path: extend forward from last segment ---
-    a, b = out[-1]
-    ux, uy = _unit_dir(a, b)  # direction pointing outward at end
-    if ux != 0.0 or uy != 0.0:
-        out[-1] = (a, (b[0] + ux * extension, b[1] + uy * extension))
-
-    return [(tuple(p), tuple(q)) for p, q in out]
-
 def path_to_segments(path):
     """
     Convert one PyMuPDF drawing path into straight segments.
@@ -93,7 +59,7 @@ def path_to_segments(path):
             ])
         elif op == "c":
             p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
-            ts = np.linspace(0, 1, 8)
+            ts = np.linspace(0, 1, 32)
             pts = []
             for t in ts:
                 x = (
@@ -218,60 +184,464 @@ def step1_read_and_draw(page, out_dir: Path, stem: str, min_segment_length: floa
 
     return records, all_segments
 
-def step2_extend_ends(records, out_dir: Path, stem: str, extension: float = 12.0):
+def step2_extend_to_first_hit(
+    records,
+    out_dir: Path,
+    stem: str,
+    max_extension: float = 12.0,
+    hit_eps: float = 0.1,
+    past_hit: float = 0.05,
+    max_rounds: int = 3,
+    lateral_tol: float = 1.0,
+):
     """
-    Step 2: extend each path's terminal stubs along their direction.
+    Step 2: each terminal extends at most once, to its nearest hit.
 
-    Does NOT snap endpoints and does NOT extend internal segments.
-    Purpose: close small dash/corner gaps so later unary_union can node
-    collinear or meeting strokes without a large snap radius.
-
-    Returns
-    -------
-    extended_records : same structure as Step 1 records, segments updated
-    all_segments     : flat list of extended segments
+    Speed notes
+    -----------
+    - Proximity tests use path terminals only (not every vertex).
+    - Foreign segments and terminals are bucketed in a grid so each ray
+      only tests nearby geometry.
+    - Multi-round, but default max_rounds=3.
     """
+    from shapely.geometry import LineString, Point
+
+    def ray_ray_intersection(o1, d1, o2, d2):
+        det = d1[0] * d2[1] - d1[1] * d2[0]
+        if abs(det) < 1e-12:
+            return None
+        ox, oy = o2[0] - o1[0], o2[1] - o1[1]
+        t = (ox * d2[1] - oy * d2[0]) / det
+        s = (ox * d1[1] - oy * d1[0]) / det
+        if t <= hit_eps or s <= hit_eps:
+            return None
+        if t > max_extension or s > max_extension:
+            return None
+        return (t, s, (o1[0] + d1[0] * t, o1[1] + d1[1] * t))
+
+    def tube_hit(origin, direction, point):
+        vx = point[0] - origin[0]
+        vy = point[1] - origin[1]
+        t = vx * direction[0] + vy * direction[1]
+        if t <= hit_eps or t > max_extension:
+            return None
+        lateral = abs(vx * direction[1] - vy * direction[0])
+        if lateral > lateral_tol:
+            return None
+        return t
+
+    def cell_key(x, y, cell):
+        return (int(x // cell), int(y // cell))
+
+    def nearby_keys(x, y, cell, radius_cells):
+        cx, cy = int(x // cell), int(y // cell)
+        out = []
+        for dx in range(-radius_cells, radius_cells + 1):
+            for dy in range(-radius_cells, radius_cells + 1):
+                out.append((cx + dx, cy + dy))
+        return out
+
+    work = [[list(s) for s in rec["segments"]] for rec in records]
+    applied = set()
+    n_seg = n_ray = n_prox = 0
+    extension_lengths = []
+    round_log = []
+
+    # grid cell ~ max_extension so one ring of neighbours covers the ray
+    cell = max(max_extension, 4.0)
+    radius_cells = 1
+
+    for rnd in range(max_rounds):
+        terminals = {}
+        for pi, segs in enumerate(work):
+            if not segs:
+                continue
+            a0, b0 = segs[0]
+            d0 = _unit_dir(b0, a0)
+            if d0 != (0.0, 0.0) and (pi, True) not in applied:
+                terminals[(pi, True)] = (tuple(a0), d0)
+            a1, b1 = segs[-1]
+            d1 = _unit_dir(a1, b1)
+            if d1 != (0.0, 0.0) and (pi, False) not in applied:
+                terminals[(pi, False)] = (tuple(b1), d1)
+
+        if not terminals:
+            round_log.append(f"  round {rnd+1}: no free terminals")
+            break
+
+        # --- grid of foreign segments ---
+        seg_grid = defaultdict(list)  # cell -> list of (path_idx, LineString)
+        for pi, segs in enumerate(work):
+            for a, b in segs:
+                if dist(a, b) <= 1e-12:
+                    continue
+                ls = LineString([a, b])
+                # index by cells covered by bbox of segment
+                x0, y0 = min(a[0], b[0]), min(a[1], b[1])
+                x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+                cx0, cy0 = int(x0 // cell), int(y0 // cell)
+                cx1, cy1 = int(x1 // cell), int(y1 // cell)
+                for cx in range(cx0, cx1 + 1):
+                    for cy in range(cy0, cy1 + 1):
+                        seg_grid[(cx, cy)].append((pi, ls))
+
+        # --- path terminals only (deduped) for proximity ---
+        # list of (path_idx, point); grid of same
+        term_pts = []
+        term_grid = defaultdict(list)
+        seen_term_pt = set()
+        for pi, segs in enumerate(work):
+            if not segs:
+                continue
+            for pt in (tuple(segs[0][0]), tuple(segs[-1][1])):
+                sp = (pi, pt)
+                if sp in seen_term_pt:
+                    continue
+                seen_term_pt.add(sp)
+                term_pts.append(sp)
+                term_grid[cell_key(pt[0], pt[1], cell)].append(sp)
+
+        candidates = []
+
+        # ---- ray vs segments (grid-limited) + proximity (terminals only) ----
+        for key, (origin, direction) in terminals.items():
+            pi = key[0]
+            tip = (
+                origin[0] + direction[0] * max_extension,
+                origin[1] + direction[1] * max_extension,
+            )
+            ray = LineString([origin, tip])
+
+            # cells along the ray bbox
+            rx0, ry0 = min(origin[0], tip[0]), min(origin[1], tip[1])
+            rx1, ry1 = max(origin[0], tip[0]), max(origin[1], tip[1])
+            cx0, cy0 = int(rx0 // cell), int(ry0 // cell)
+            cx1, cy1 = int(rx1 // cell), int(ry1 // cell)
+
+            best_t, best_pt = None, None
+            tested_seg = set()  # id(LineString) or (pi, id) avoid retest
+            for cx in range(cx0 - radius_cells, cx1 + radius_cells + 1):
+                for cy in range(cy0 - radius_cells, cy1 + radius_cells + 1):
+                    for other_pi, other_ls in seg_grid.get((cx, cy), []):
+                        if other_pi == pi:
+                            continue
+                        sid = (other_pi, id(other_ls))
+                        if sid in tested_seg:
+                            continue
+                        tested_seg.add(sid)
+                        try:
+                            inter = ray.intersection(other_ls)
+                        except Exception:
+                            continue
+                        if inter.is_empty:
+                            continue
+                        points = []
+                        if inter.geom_type == "Point":
+                            points = [inter]
+                        elif inter.geom_type == "MultiPoint":
+                            points = list(inter.geoms)
+                        elif inter.geom_type == "LineString":
+                            c = list(inter.coords)
+                            points = [Point(c[0]), Point(c[-1])]
+                        elif inter.geom_type == "GeometryCollection":
+                            points = [g for g in inter.geoms if g.geom_type == "Point"]
+                        for p in points:
+                            t = dist(origin, (p.x, p.y))
+                            if t <= hit_eps or t > max_extension:
+                                continue
+                            if (p.x - origin[0]) * direction[0] + (p.y - origin[1]) * direction[1] < 0:
+                                continue
+                            if best_t is None or t < best_t:
+                                best_t = t
+                                best_pt = (
+                                    origin[0] + direction[0] * (t + past_hit),
+                                    origin[1] + direction[1] * (t + past_hit),
+                                )
+            if best_t is not None:
+                candidates.append(("seg", best_t, key, best_pt))
+
+            # proximity: only nearby path terminals
+            best_pt_t, best_pt_pt = None, None
+            tested_pt = set()
+            for ck in nearby_keys(origin[0], origin[1], cell, radius_cells + 1):
+                for other_pi, pt in term_grid.get(ck, []):
+                    if other_pi == pi:
+                        continue
+                    if (other_pi, pt) in tested_pt:
+                        continue
+                    tested_pt.add((other_pi, pt))
+                    t = tube_hit(origin, direction, pt)
+                    if t is None:
+                        continue
+                    if best_pt_t is None or t < best_pt_t:
+                        best_pt_t = t
+                        best_pt_pt = (
+                            origin[0] + direction[0] * (t + past_hit),
+                            origin[1] + direction[1] * (t + past_hit),
+                        )
+            if best_pt_t is not None:
+                candidates.append(("prox", best_pt_t, key, best_pt_pt))
+
+        # ---- ray vs ray (only free terminals; still O(m^2) in m free ends) ----
+        keys = list(terminals.keys())
+        seen = set()
+        for i, k1 in enumerate(keys):
+            o1, d1 = terminals[k1]
+            # only pair with terminals in nearby cells
+            near_keys = set()
+            for ck in nearby_keys(o1[0], o1[1], cell, radius_cells + 1):
+                near_keys.add(ck)
+            for k2 in keys[i + 1:]:
+                if k2[0] == k1[0]:
+                    continue
+                o2, d2 = terminals[k2]
+                if cell_key(o2[0], o2[1], cell) not in near_keys:
+                    # also allow if o2 is along ray within max_extension bbox
+                    if dist(o1, o2) > max_extension * 1.5:
+                        continue
+                hit = ray_ray_intersection(o1, d1, o2, d2)
+                if hit is None:
+                    continue
+                t1, t2, p = hit
+                pair = frozenset([k1, k2])
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                candidates.append(("ray", min(t1, t2), k1, t1, k2, t2, p))
+
+        # best per terminal: seg/ray first; prox only if no geometric hit
+        best_for = {}
+        has_geom = defaultdict(bool)
+
+        for cand in candidates:
+            if cand[0] == "seg":
+                _, t, key, pt = cand
+                has_geom[key] = True
+                if key not in best_for or t < best_for[key][0]:
+                    best_for[key] = (t, cand)
+            elif cand[0] == "ray":
+                _, _, k1, t1, k2, t2, p = cand
+                has_geom[k1] = True
+                has_geom[k2] = True
+                if k1 not in best_for or t1 < best_for[k1][0]:
+                    best_for[k1] = (t1, cand)
+                if k2 not in best_for or t2 < best_for[k2][0]:
+                    best_for[k2] = (t2, cand)
+
+        for cand in candidates:
+            if cand[0] != "prox":
+                continue
+            _, t, key, pt = cand
+            if has_geom[key]:
+                continue
+            if key not in best_for or t < best_for[key][0]:
+                best_for[key] = (t, cand)
+
+        def set_terminal(key, pt):
+            pi, is_start = key
+            if not work[pi]:
+                return
+            if is_start:
+                work[pi][0][0] = pt
+            else:
+                work[pi][-1][1] = pt
+
+        applied_this_round = 0
+        for key, (t, cand) in sorted(best_for.items(), key=lambda kv: kv[1][0]):
+            if key in applied:
+                continue
+            if cand[0] in ("seg", "prox"):
+                _, t, k, pt = cand
+                if k in applied:
+                    continue
+                set_terminal(k, pt)
+                applied.add(k)
+                applied_this_round += 1
+                extension_lengths.append(t)
+                if cand[0] == "seg":
+                    n_seg += 1
+                else:
+                    n_prox += 1
+            else:
+                _, _, k1, t1, k2, t2, p = cand
+                if k1 in applied or k2 in applied:
+                    continue
+                if best_for.get(k1, (None,))[1] is not cand:
+                    continue
+                if best_for.get(k2, (None,))[1] is not cand:
+                    continue
+                o1, d1 = terminals[k1]
+                o2, d2 = terminals[k2]
+                p1 = (o1[0] + d1[0] * (t1 + past_hit), o1[1] + d1[1] * (t1 + past_hit))
+                p2 = (o2[0] + d2[0] * (t2 + past_hit), o2[1] + d2[1] * (t2 + past_hit))
+                set_terminal(k1, p1)
+                set_terminal(k2, p2)
+                applied.add(k1)
+                applied.add(k2)
+                applied_this_round += 1
+                n_ray += 1
+                extension_lengths.append(t1)
+                extension_lengths.append(t2)
+
+        round_log.append(
+            f"  round {rnd+1}: free={len(terminals)}  cand={len(candidates)}  "
+            f"applied={applied_this_round}"
+        )
+        if applied_this_round == 0:
+            break
+
     extended_records = []
     all_segments = []
-    n_extended = 0
-
-    for rec in records:
-        segs = rec["segments"]
-        if not segs:
-            continue
-        new_segs = extend_polyline_ends(segs, extension)
-        if new_segs != segs:
-            n_extended += 1
+    for pi, rec in enumerate(records):
+        segs = work[pi]
+        new_segs = [(tuple(a), tuple(b)) for a, b in segs] if segs else []
         new_rec = dict(rec)
         new_rec["segments"] = new_segs
-        new_rec["length"] = sum(dist(a, b) for a, b in new_segs)
+        new_rec["length"] = sum(dist(a, b) for a, b in new_segs) if new_segs else 0.0
         extended_records.append(new_rec)
         all_segments.extend(new_segs)
 
-    # --- text summary ---
     summary_path = out_dir / f"{stem}_step2_summary.txt"
     bbox = segments_bbox(all_segments)
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("STEP 2 – directional end extension\n")
-        f.write(f"  extension length : {extension}\n")
-        f.write(f"  paths processed  : {len(extended_records)}\n")
-        f.write(f"  paths changed    : {n_extended}\n")
-        f.write(f"  segments total   : {len(all_segments)}\n")
-        f.write(f"  bbox             : {bbox}\n")
+        f.write("STEP 2 – multi-round nearest hit (grid + terminal prox)\n")
+        f.write(f"  max_extension     : {max_extension}\n")
+        f.write(f"  lateral_tol       : {lateral_tol}\n")
+        f.write(f"  max_rounds        : {max_rounds}\n")
+        f.write(f"  segment-hit joins : {n_seg}\n")
+        f.write(f"  ray–ray joins     : {n_ray}\n")
+        f.write(f"  proximity joins   : {n_prox}\n")
+        f.write(f"  terminals done    : {len(applied)}\n")
+        for line in round_log:
+            f.write(line + "\n")
+        if extension_lengths:
+            f.write(
+                f"  hit distance      : min={min(extension_lengths):.2f}  "
+                f"max={max(extension_lengths):.2f}  "
+                f"mean={sum(extension_lengths)/len(extension_lengths):.2f}\n"
+            )
+        f.write(f"  segments total    : {len(all_segments)}\n")
+        f.write(f"  bbox              : {bbox}\n")
     print(f"Step 2 summary → {summary_path}")
 
-    # --- PNG: show original (thin grey) + extended (coloured) ---
     png_path = out_dir / f"{stem}_step2_extended.png"
     _draw_step2_debug(
         original_records=records,
         extended_records=extended_records,
         page_bbox=bbox,
         out_path=png_path,
-        extension=extension,
+        extension=max_extension,
     )
     print(f"Step 2 image   → {png_path}")
 
     return extended_records, all_segments
+
+
+def step3_snap_and_union(
+    records,
+    out_dir: Path,
+    stem: str,
+    snap_tol: float = 0.05,
+):
+    """
+    Step 3: tiny endpoint snap (float-noise only) + unary_union noding.
+
+    snap_tol ~ 0.01–0.1 is intentional: we are NOT bridging dash gaps here
+    (extension already did that). We only collapse near-identical coordinates
+    so GEOS does not leave hairline gaps that break polygonize.
+
+    unary_union builds the planar arrangement: intersections become nodes,
+    overlapping collinear pieces merge.
+
+    Returns
+    -------
+    noded_geom : shapely geometry (often MultiLineString / GeometryCollection)
+    noded_segments : list of ((x1,y1),(x2,y2)) extracted for plotting
+    """
+    from shapely.geometry import LineString, MultiLineString, Point
+    from shapely.ops import unary_union
+
+    # --- flat list of segments from records ---
+    segs = []
+    for rec in records:
+        segs.extend(rec["segments"])
+
+    if not segs:
+        print("Step 3: no segments")
+        return None, []
+
+    # --- tiny endpoint snap via coordinate quantisation ---
+    # Group endpoints that fall in the same snap cell, replace by mean.
+    def snap_key(p):
+        return (round(p[0] / snap_tol), round(p[1] / snap_tol))
+
+    buckets = defaultdict(list)
+    for a, b in segs:
+        buckets[snap_key(a)].append(a)
+        buckets[snap_key(b)].append(b)
+
+    rep = {}
+    for k, pts in buckets.items():
+        mx = sum(p[0] for p in pts) / len(pts)
+        my = sum(p[1] for p in pts) / len(pts)
+        rep[k] = (mx, my)
+
+    snapped = []
+    for a, b in segs:
+        a2, b2 = rep[snap_key(a)], rep[snap_key(b)]
+        if dist(a2, b2) > 1e-9:
+            snapped.append((a2, b2))
+
+    # --- unary_union (noding) ---
+    lines = [LineString([a, b]) for a, b in snapped]
+    noded = unary_union(MultiLineString(lines))
+
+    # extract segments for debug plot
+    noded_segments = []
+    geoms = []
+    if noded.is_empty:
+        pass
+    elif noded.geom_type == "LineString":
+        geoms = [noded]
+    elif noded.geom_type == "MultiLineString":
+        geoms = list(noded.geoms)
+    elif hasattr(noded, "geoms"):
+        geoms = [g for g in noded.geoms if g.geom_type in ("LineString", "MultiLineString")]
+        flat = []
+        for g in geoms:
+            if g.geom_type == "LineString":
+                flat.append(g)
+            else:
+                flat.extend(g.geoms)
+        geoms = flat
+
+    for g in geoms:
+        coords = list(g.coords)
+        for i in range(len(coords) - 1):
+            noded_segments.append((coords[i], coords[i + 1]))
+
+    # --- summary ---
+    summary_path = out_dir / f"{stem}_step3_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("STEP 3 – tiny snap + unary_union\n")
+        f.write(f"  snap_tol           : {snap_tol}\n")
+        f.write(f"  input segments     : {len(segs)}\n")
+        f.write(f"  after snap         : {len(snapped)}\n")
+        f.write(f"  noded geom type    : {noded.geom_type}\n")
+        f.write(f"  noded pieces       : {len(geoms)}\n")
+        f.write(f"  noded segments out : {len(noded_segments)}\n")
+        if not noded.is_empty:
+            f.write(f"  noded bounds       : {noded.bounds}\n")
+            f.write(f"  noded length       : {noded.length:.1f}\n")
+    print(f"Step 3 summary → {summary_path}")
+
+    # --- PNG ---
+    png_path = out_dir / f"{stem}_step3_noded.png"
+    _draw_noded_debug(noded_segments, noded.bounds if not noded.is_empty else (0, 0, 1, 1),
+                      png_path, snap_tol)
+    print(f"Step 3 image   → {png_path}")
+
+    return noded, noded_segments
 
 
 def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title: str):
@@ -333,7 +703,7 @@ def _draw_step2_debug(original_records, extended_records, page_bbox, out_path, e
     ax.set_ylim(y1 + pad, y0 - pad)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title(f"STEP 2 – end extension (len={extension})", fontsize=11)
+    ax.set_title(f"STEP 2 – extend to first hit (max={extension})", fontsize=11)
 
     # originals in grey
     orig_segs = [s for r in original_records for s in r["segments"]]
@@ -355,7 +725,36 @@ def _draw_step2_debug(original_records, extended_records, page_bbox, out_path, e
 
     ax.text(
         0.01, 0.99,
-        f"grey=original  colour=extended  extension={extension}",
+        f"grey=original  colour=extended  max_extension={extension}",
+        transform=ax.transAxes, fontsize=9, va="top",
+        bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close()
+
+def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
+    """Single-colour plot of the noded linework."""
+    x0, y0, x1, y1 = bounds
+    pad = 20.0
+    w = max(x1 - x0, 1.0)
+    h = max(y1 - y0, 1.0)
+    fig_w = 14
+    fig_h = max(6.0, fig_w * h / w)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.set_xlim(x0 - pad, x1 + pad)
+    ax.set_ylim(y1 + pad, y0 - pad)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(f"STEP 3 – snap({snap_tol}) + unary_union", fontsize=11)
+
+    if noded_segments:
+        lc = LineCollection(noded_segments, colors=["0.15"], linewidths=1.0, alpha=0.9)
+        ax.add_collection(lc)
+
+    ax.text(
+        0.01, 0.99,
+        f"noded segments={len(noded_segments)}  snap_tol={snap_tol}",
         transform=ax.transAxes, fontsize=9, va="top",
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
@@ -413,14 +812,23 @@ def main():
         )
         print(f"  paths={len(records)}  segments={len(all_segments)}")
 
-        # ----- STEP 2 - Extension -----
-        ext_records, ext_segments = step2_extend_ends(
+        # ----- STEP 2 - Extend to first hit -----
+        ext_records, ext_segments = step2_extend_to_first_hit(
             records,
             out_dir=out_dir,
             stem=page_stem,
-            extension=12.0,   # tune from typical dash gap; try 8–15
+            max_extension=12.0,  # ceiling only; actual length = first hit
         )
-        print(f"  step2 segments={len(ext_segments)}")        
+        print(f"  step2 segments={len(ext_segments)}")      
+
+        # ----- STEP 3 - Snap + unary union -----
+        noded, noded_segments = step3_snap_and_union(
+            ext_records,
+            out_dir=out_dir,
+            stem=page_stem,
+            snap_tol=0.05,   # float noise only; try 0.01–0.1
+        )
+        print(f"  step3 noded segments={len(noded_segments)}")        
 
     doc.close()
     print("\nDone. Check the Step 1 PNG and summary txt.")
@@ -428,3 +836,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# TODO
+# Handle converging paths.
+    # Snap together points at junction if more then 3 path endpoints are within a 5 point radius? 10-HAUTS example, top left pattern bottom left corner. 
