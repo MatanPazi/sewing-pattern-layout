@@ -414,29 +414,19 @@ def step2_extend_to_first_hit(
         best_for = {}
         has_geom = defaultdict(bool)
 
+        # best per terminal (seg, ray, prox all compete — smallest t wins)
+        best_for = {}
         for cand in candidates:
-            if cand[0] == "seg":
+            if cand[0] in ("seg", "prox"):
                 _, t, key, pt = cand
-                has_geom[key] = True
                 if key not in best_for or t < best_for[key][0]:
                     best_for[key] = (t, cand)
-            elif cand[0] == "ray":
+            else:
                 _, _, k1, t1, k2, t2, p = cand
-                has_geom[k1] = True
-                has_geom[k2] = True
                 if k1 not in best_for or t1 < best_for[k1][0]:
                     best_for[k1] = (t1, cand)
                 if k2 not in best_for or t2 < best_for[k2][0]:
                     best_for[k2] = (t2, cand)
-
-        for cand in candidates:
-            if cand[0] != "prox":
-                continue
-            _, t, key, pt = cand
-            if has_geom[key]:
-                continue
-            if key not in best_for or t < best_for[key][0]:
-                best_for[key] = (t, cand)
 
         def set_terminal(key, pt):
             pi, is_start = key
@@ -547,15 +537,14 @@ def step3_snap_open_to_hits(
     hit_points,
     out_dir: Path,
     stem: str,
-    hit_cluster: float = 0.5,
-    search_radius: float = 5.0,
+    join_radius: float = 5.0,
 ):
     """
-    Step 3: if ≥2 extension hits sit within hit_cluster of each other,
-    snap any still-open terminal within search_radius onto that cluster.
+    Step 3: one-pass join.
 
-    applied     : set of (path_idx, is_start) that Step 2 already extended
-    hit_points  : list of (x, y) destinations from those extensions
+    Points = all hit-cluster centroids (any size) + all still-open terminals.
+    Union anything within join_radius. Each group of 2+ snaps to its
+    average. No n>=3 filter.
     """
     work = [[list(s) for s in rec["segments"]] for rec in records]
 
@@ -567,8 +556,35 @@ def step3_snap_open_to_hits(
         else:
             work[pi][-1][1] = pt
 
-    # --- cluster hit points ---
-    parent = list(range(len(hit_points)))
+    def end_flag(s):
+        return s == "start" or s is True
+
+    nodes = []
+
+    for hit in hit_points:
+        nodes.append({
+            "kind": "hit",
+            "pt": tuple(hit["pt"]),
+            "n": 1,
+            "members": [hit],
+        })
+
+    for pi, segs in enumerate(work):
+        if not segs:
+            continue
+        for is_start, pt in ((True, tuple(segs[0][0])), (False, tuple(segs[-1][1]))):
+            if (pi, is_start) in applied:
+                continue
+            nodes.append({
+                "kind": "open",
+                "pt": pt,
+                "n": 1,
+                "pi": pi,
+                "is_start": is_start,
+            })
+
+    # --- union-find nodes within join_radius ---
+    parent = list(range(len(nodes)))
 
     def find(i):
         while parent[i] != i:
@@ -581,66 +597,52 @@ def step3_snap_open_to_hits(
         if ra != rb:
             parent[rb] = ra
 
-    for i, p in enumerate(hit_points):
-        for j in range(i + 1, len(hit_points)):
-            if dist(p["pt"], hit_points[j]["pt"]) <= hit_cluster:
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if dist(nodes[i]["pt"], nodes[j]["pt"]) <= join_radius:
                 union(i, j)
 
-    clusters = defaultdict(list)
-    for i in range(len(hit_points)):
-        clusters[find(i)].append(i)
+    groups = defaultdict(list)
+    for i in range(len(nodes)):
+        groups[find(i)].append(i)
 
-    junctions = []
-    for idxs in clusters.values():
-        if len(idxs) < 3:
-            continue
-        pts = [hit_points[i]["pt"] for i in idxs]
-        cx = sum(p[0] for p in pts) / len(pts)
-        cy = sum(p[1] for p in pts) / len(pts)
-        members = [hit_points[i] for i in idxs]
-        junctions.append({
-            "point": (cx, cy),
-            "n": len(idxs),
-            "members": members,
-        })
-
-    open_list = []   # (pi, is_start, pt)
-
-    # --- open terminals = not in applied ---
     events = []
-    n_open = n_snapped = n_no_j = 0
+    n_snapped = 0
 
-    for pi, segs in enumerate(work):
-        if not segs:
+    for idxs in groups.values():
+        if len(idxs) < 2:
             continue
-        ends = [(True, tuple(segs[0][0])), (False, tuple(segs[-1][1]))]
-        for is_start, pt in ends:
-            if (pi, is_start) in applied:
-                continue
-            n_open += 1
-            open_list.append((pi, is_start, pt))
+        pts = [nodes[i]["pt"] for i in idxs]
+        avg = (
+            sum(p[0] for p in pts) / len(pts),
+            sum(p[1] for p in pts) / len(pts),
+        )
 
-            best, best_d = None, None
-            for junc in junctions:
-                d = dist(pt, junc["point"])
-                if d > search_radius:
-                    continue
-                if best_d is None or d < best_d:
-                    best_d = d
-                    best = junc
+        kinds = [nodes[i]["kind"] for i in idxs]
+        events.append(
+            f"GROUP size={len(idxs)}  avg=({avg[0]:.3f},{avg[1]:.3f})  "
+            f"kinds={kinds}"
+        )
 
-            if best is None:
-                n_no_j += 1
-                continue
-
-            set_terminal(pi, is_start, best["point"])
-            n_snapped += 1
-            events.append(
-                f"JUNCTION_SNAP  path={pi} end={'start' if is_start else 'end'}  "
-                f"terminal=({pt[0]:.2f},{pt[1]:.2f})  "
-                f"junction=({best['point'][0]:.2f},{best['point'][1]:.2f})  "
-                f"n_hits={best['n']}  dist={best_d:.2f}"
-            )
+        for i in idxs:
+            nd = nodes[i]
+            if nd["kind"] == "open":
+                set_terminal(nd["pi"], nd["is_start"], avg)
+                n_snapped += 1
+                events.append(
+                    f"  SNAP open  path={nd['pi']}  "
+                    f"end={'start' if nd['is_start'] else 'end'}  "
+                    f"from=({nd['pt'][0]:.3f},{nd['pt'][1]:.3f})"
+                )
+            else:
+                for m in nd["members"]:
+                    set_terminal(m["path"], end_flag(m["end"]), avg)
+                    n_snapped += 1
+                events.append(
+                    f"  SNAP hit-cluster n={nd['n']}  "
+                    f"from=({nd['pt'][0]:.3f},{nd['pt'][1]:.3f})  "
+                    f"paths={[m['path'] for m in nd['members']]}"
+                )
 
     out_records = []
     all_segments = []
@@ -653,58 +655,16 @@ def step3_snap_open_to_hits(
         out_records.append(new_rec)
         all_segments.extend(new_segs)
 
+    n_open = sum(1 for nd in nodes if nd["kind"] == "open")
     summary_path = out_dir / f"{stem}_step3_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("STEP 3 – snap open terminals to clustered extension hits\n")
-        f.write(f"  hit_cluster    : {hit_cluster}\n")
-        f.write(f"  search_radius  : {search_radius}\n")
-        f.write(f"  hit_points     : {len(hit_points)}\n")
-        f.write(f"  clusters (>=3) : {len(junctions)}\n")
-        f.write(f"  open terminals : {n_open}\n")
-        f.write(f"  snaps applied  : {n_snapped}\n")
-        f.write(f"  open w/o cluster: {n_no_j}\n")
-
-        f.write("\n--- Open terminals ---\n")
-        if not open_list:
-            f.write("  (none)\n")
-        else:
-            for pi, is_start, pt in open_list:
-                rec = records[pi]
-                f.write(
-                    f"  path={pi:4d}  end={'start' if is_start else 'end  '}  "
-                    f"pt=({pt[0]:.3f}, {pt[1]:.3f})  "
-                    f"orig_path_id={rec.get('path_id', '?')}  "
-                    f"colour={rec.get('color')}  "
-                    f"len={rec.get('length', 0):.1f}\n"
-                )
-
-        f.write("\n--- Hit-point clusters (size >= 3) ---\n")
-        if not junctions:
-            f.write("  (none)\n")
-        else:
-            for i, junc in enumerate(junctions):
-                f.write(
-                    f"  cluster {i}: n_hits={junc['n']}  "
-                    f"point=({junc['point'][0]:.3f}, {junc['point'][1]:.3f})\n"
-                )
-                for m in junc["members"]:
-                    rec = records[m["path"]]
-                    f.write(
-                        f"      path={m['path']:4d}  end={m['end']:5s}  "
-                        f"hit=({m['pt'][0]:.3f}, {m['pt'][1]:.3f})  "
-                        f"orig_path_id={rec.get('path_id', '?')}  "
-                        f"colour={rec.get('color')}\n"
-                    )
-
-        f.write("\n--- All hit-point clusters (any size, for diagnosis) ---\n")
-        for root, idxs in clusters.items():
-            pts = [hit_points[i]["pt"] for i in idxs]
-            cx = sum(p[0] for p in pts) / len(pts)
-            cy = sum(p[1] for p in pts) / len(pts)
-            f.write(
-                f"  size={len(idxs):3d}  centroid=({cx:.3f}, {cy:.3f})\n"
-            )
-
+        f.write("STEP 3 – join hit points + open terminals (one pass, any size)\n")
+        f.write(f"  join_radius   : {join_radius}\n")
+        f.write(f"  hit_points    : {len(hit_points)}\n")
+        f.write(f"  hit nodes     : {sum(1 for nd in nodes if nd['kind']=='hit')}\n")
+        f.write(f"  open terminals: {n_open}\n")
+        f.write(f"  groups >=2    : {sum(1 for v in groups.values() if len(v)>=2)}\n")
+        f.write(f"  snaps         : {n_snapped}\n")
         f.write("\nEvents:\n")
         if events:
             for line in events:
@@ -720,7 +680,7 @@ def step3_snap_open_to_hits(
         extended_records=out_records,
         page_bbox=bbox,
         out_path=png_path,
-        extension=search_radius,
+        extension=join_radius,
     )
     print(f"Step 3 image   → {png_path}")
 
@@ -1017,14 +977,13 @@ def main():
             hit_points,
             out_dir=out_dir,
             stem=page_stem,
-            hit_cluster=0.2,
-            search_radius=5.0,
+            join_radius=5.0,
         )
         print(f"  step3 segments={len(junc_segments)}")
 
         # ----- STEP 4 - Snap + unary union -----
         noded, noded_segments = step4_snap_and_union(
-            ext_records,
+            junc_records,
             out_dir=out_dir,
             stem=page_stem,
             snap_tol=0.05,   # float noise only; try 0.01–0.1
