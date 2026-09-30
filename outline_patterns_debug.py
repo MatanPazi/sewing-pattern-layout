@@ -191,7 +191,7 @@ def step2_extend_to_first_hit(
     max_extension: float = 12.0,
     hit_eps: float = 0.1,
     past_hit: float = 0.05,
-    max_rounds: int = 3,
+    max_rounds: int = 5,
     lateral_tol: float = 1.0,
 ):
     """
@@ -246,6 +246,7 @@ def step2_extend_to_first_hit(
     n_seg = n_ray = n_prox = 0
     extension_lengths = []
     round_log = []
+    hit_points = []   # destinations of successful extensions
 
     # grid cell ~ max_extension so one ring of neighbours covers the ray
     cell = max(max_extension, 4.0)
@@ -455,6 +456,7 @@ def step2_extend_to_first_hit(
                 if k in applied:
                     continue
                 set_terminal(k, pt)
+                hit_points.append({"pt": tuple(pt), "path": k[0], "end": "start" if k[1] else "end"})
                 applied.add(k)
                 applied_this_round += 1
                 extension_lengths.append(t)
@@ -476,6 +478,8 @@ def step2_extend_to_first_hit(
                 p2 = (o2[0] + d2[0] * (t2 + past_hit), o2[1] + d2[1] * (t2 + past_hit))
                 set_terminal(k1, p1)
                 set_terminal(k2, p2)
+                hit_points.append({"pt": tuple(p1), "path": k1[0], "end": "start" if k1[1] else "end"})
+                hit_points.append({"pt": tuple(p2), "path": k2[0], "end": "start" if k2[1] else "end"})
                 applied.add(k1)
                 applied.add(k2)
                 applied_this_round += 1
@@ -534,17 +538,202 @@ def step2_extend_to_first_hit(
     )
     print(f"Step 2 image   → {png_path}")
 
-    return extended_records, all_segments
+    return extended_records, all_segments, applied, hit_points
 
 
-def step3_snap_and_union(
+def step3_snap_open_to_hits(
+    records,
+    applied,
+    hit_points,
+    out_dir: Path,
+    stem: str,
+    hit_cluster: float = 0.5,
+    search_radius: float = 5.0,
+):
+    """
+    Step 3: if ≥2 extension hits sit within hit_cluster of each other,
+    snap any still-open terminal within search_radius onto that cluster.
+
+    applied     : set of (path_idx, is_start) that Step 2 already extended
+    hit_points  : list of (x, y) destinations from those extensions
+    """
+    work = [[list(s) for s in rec["segments"]] for rec in records]
+
+    def set_terminal(pi, is_start, pt):
+        if not work[pi]:
+            return
+        if is_start:
+            work[pi][0][0] = pt
+        else:
+            work[pi][-1][1] = pt
+
+    # --- cluster hit points ---
+    parent = list(range(len(hit_points)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, p in enumerate(hit_points):
+        for j in range(i + 1, len(hit_points)):
+            if dist(p["pt"], hit_points[j]["pt"]) <= hit_cluster:
+                union(i, j)
+
+    clusters = defaultdict(list)
+    for i in range(len(hit_points)):
+        clusters[find(i)].append(i)
+
+    junctions = []
+    for idxs in clusters.values():
+        if len(idxs) < 3:
+            continue
+        pts = [hit_points[i]["pt"] for i in idxs]
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        members = [hit_points[i] for i in idxs]
+        junctions.append({
+            "point": (cx, cy),
+            "n": len(idxs),
+            "members": members,
+        })
+
+    open_list = []   # (pi, is_start, pt)
+
+    # --- open terminals = not in applied ---
+    events = []
+    n_open = n_snapped = n_no_j = 0
+
+    for pi, segs in enumerate(work):
+        if not segs:
+            continue
+        ends = [(True, tuple(segs[0][0])), (False, tuple(segs[-1][1]))]
+        for is_start, pt in ends:
+            if (pi, is_start) in applied:
+                continue
+            n_open += 1
+            open_list.append((pi, is_start, pt))
+
+            best, best_d = None, None
+            for junc in junctions:
+                d = dist(pt, junc["point"])
+                if d > search_radius:
+                    continue
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = junc
+
+            if best is None:
+                n_no_j += 1
+                continue
+
+            set_terminal(pi, is_start, best["point"])
+            n_snapped += 1
+            events.append(
+                f"JUNCTION_SNAP  path={pi} end={'start' if is_start else 'end'}  "
+                f"terminal=({pt[0]:.2f},{pt[1]:.2f})  "
+                f"junction=({best['point'][0]:.2f},{best['point'][1]:.2f})  "
+                f"n_hits={best['n']}  dist={best_d:.2f}"
+            )
+
+    out_records = []
+    all_segments = []
+    for pi, rec in enumerate(records):
+        segs = work[pi]
+        new_segs = [(tuple(a), tuple(b)) for a, b in segs] if segs else []
+        new_rec = dict(rec)
+        new_rec["segments"] = new_segs
+        new_rec["length"] = sum(dist(a, b) for a, b in new_segs) if new_segs else 0.0
+        out_records.append(new_rec)
+        all_segments.extend(new_segs)
+
+    summary_path = out_dir / f"{stem}_step3_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("STEP 3 – snap open terminals to clustered extension hits\n")
+        f.write(f"  hit_cluster    : {hit_cluster}\n")
+        f.write(f"  search_radius  : {search_radius}\n")
+        f.write(f"  hit_points     : {len(hit_points)}\n")
+        f.write(f"  clusters (>=3) : {len(junctions)}\n")
+        f.write(f"  open terminals : {n_open}\n")
+        f.write(f"  snaps applied  : {n_snapped}\n")
+        f.write(f"  open w/o cluster: {n_no_j}\n")
+
+        f.write("\n--- Open terminals ---\n")
+        if not open_list:
+            f.write("  (none)\n")
+        else:
+            for pi, is_start, pt in open_list:
+                rec = records[pi]
+                f.write(
+                    f"  path={pi:4d}  end={'start' if is_start else 'end  '}  "
+                    f"pt=({pt[0]:.3f}, {pt[1]:.3f})  "
+                    f"orig_path_id={rec.get('path_id', '?')}  "
+                    f"colour={rec.get('color')}  "
+                    f"len={rec.get('length', 0):.1f}\n"
+                )
+
+        f.write("\n--- Hit-point clusters (size >= 3) ---\n")
+        if not junctions:
+            f.write("  (none)\n")
+        else:
+            for i, junc in enumerate(junctions):
+                f.write(
+                    f"  cluster {i}: n_hits={junc['n']}  "
+                    f"point=({junc['point'][0]:.3f}, {junc['point'][1]:.3f})\n"
+                )
+                for m in junc["members"]:
+                    rec = records[m["path"]]
+                    f.write(
+                        f"      path={m['path']:4d}  end={m['end']:5s}  "
+                        f"hit=({m['pt'][0]:.3f}, {m['pt'][1]:.3f})  "
+                        f"orig_path_id={rec.get('path_id', '?')}  "
+                        f"colour={rec.get('color')}\n"
+                    )
+
+        f.write("\n--- All hit-point clusters (any size, for diagnosis) ---\n")
+        for root, idxs in clusters.items():
+            pts = [hit_points[i]["pt"] for i in idxs]
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            f.write(
+                f"  size={len(idxs):3d}  centroid=({cx:.3f}, {cy:.3f})\n"
+            )
+
+        f.write("\nEvents:\n")
+        if events:
+            for line in events:
+                f.write(f"  {line}\n")
+        else:
+            f.write("  (none)\n")
+    print(f"Step 3 summary → {summary_path}")
+
+    png_path = out_dir / f"{stem}_step3_junctions.png"
+    bbox = segments_bbox(all_segments)
+    _draw_step2_debug(
+        original_records=records,
+        extended_records=out_records,
+        page_bbox=bbox,
+        out_path=png_path,
+        extension=search_radius,
+    )
+    print(f"Step 3 image   → {png_path}")
+
+    return out_records, all_segments
+
+def step4_snap_and_union(
     records,
     out_dir: Path,
     stem: str,
     snap_tol: float = 0.05,
 ):
     """
-    Step 3: tiny endpoint snap (float-noise only) + unary_union noding.
+    step 4: tiny endpoint snap (float-noise only) + unary_union noding.
 
     snap_tol ~ 0.01–0.1 is intentional: we are NOT bridging dash gaps here
     (extension already did that). We only collapse near-identical coordinates
@@ -567,7 +756,7 @@ def step3_snap_and_union(
         segs.extend(rec["segments"])
 
     if not segs:
-        print("Step 3: no segments")
+        print("step 4: no segments")
         return None, []
 
     # --- tiny endpoint snap via coordinate quantisation ---
@@ -621,9 +810,9 @@ def step3_snap_and_union(
             noded_segments.append((coords[i], coords[i + 1]))
 
     # --- summary ---
-    summary_path = out_dir / f"{stem}_step3_summary.txt"
+    summary_path = out_dir / f"{stem}_step4_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("STEP 3 – tiny snap + unary_union\n")
+        f.write("step 4 – tiny snap + unary_union\n")
         f.write(f"  snap_tol           : {snap_tol}\n")
         f.write(f"  input segments     : {len(segs)}\n")
         f.write(f"  after snap         : {len(snapped)}\n")
@@ -633,13 +822,13 @@ def step3_snap_and_union(
         if not noded.is_empty:
             f.write(f"  noded bounds       : {noded.bounds}\n")
             f.write(f"  noded length       : {noded.length:.1f}\n")
-    print(f"Step 3 summary → {summary_path}")
+    print(f"step 4 summary → {summary_path}")
 
     # --- PNG ---
-    png_path = out_dir / f"{stem}_step3_noded.png"
+    png_path = out_dir / f"{stem}_step4_noded.png"
     _draw_noded_debug(noded_segments, noded.bounds if not noded.is_empty else (0, 0, 1, 1),
                       png_path, snap_tol)
-    print(f"Step 3 image   → {png_path}")
+    print(f"step 4 image   → {png_path}")
 
     return noded, noded_segments
 
@@ -746,7 +935,7 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
     ax.set_ylim(y1 + pad, y0 - pad)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title(f"STEP 3 – snap({snap_tol}) + unary_union", fontsize=11)
+    ax.set_title(f"step 4 – snap({snap_tol}) + unary_union", fontsize=11)
 
     if noded_segments:
         lc = LineCollection(noded_segments, colors=["0.15"], linewidths=1.0, alpha=0.9)
@@ -813,22 +1002,34 @@ def main():
         print(f"  paths={len(records)}  segments={len(all_segments)}")
 
         # ----- STEP 2 - Extend to first hit -----
-        ext_records, ext_segments = step2_extend_to_first_hit(
+        ext_records, ext_segments, applied, hit_points = step2_extend_to_first_hit(
             records,
             out_dir=out_dir,
             stem=page_stem,
-            max_extension=12.0,  # ceiling only; actual length = first hit
+            max_extension=12.0,
         )
-        print(f"  step2 segments={len(ext_segments)}")      
+        print(f"  step2  extended_ends={len(applied)}  hit_points={len(hit_points)}")
 
-        # ----- STEP 3 - Snap + unary union -----
-        noded, noded_segments = step3_snap_and_union(
+        # ----- STEP 3 - junction snapping -----
+        junc_records, junc_segments = step3_snap_open_to_hits(
+            ext_records,
+            applied,
+            hit_points,
+            out_dir=out_dir,
+            stem=page_stem,
+            hit_cluster=0.2,
+            search_radius=5.0,
+        )
+        print(f"  step3 segments={len(junc_segments)}")
+
+        # ----- STEP 4 - Snap + unary union -----
+        noded, noded_segments = step4_snap_and_union(
             ext_records,
             out_dir=out_dir,
             stem=page_stem,
             snap_tol=0.05,   # float noise only; try 0.01–0.1
         )
-        print(f"  step3 noded segments={len(noded_segments)}")        
+        print(f"  step4 noded segments={len(noded_segments)}")        
 
     doc.close()
     print("\nDone. Check the Step 1 PNG and summary txt.")
