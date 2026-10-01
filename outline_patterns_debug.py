@@ -108,7 +108,6 @@ def segments_bbox(segments):
     ys = [p[1] for s in segments for p in s]
     return (min(xs), min(ys), max(xs), max(ys))
 
-
 def step1_read_and_draw(page, out_dir: Path, stem: str, min_segment_length: float = 0.5):
     """
     Step 1: extract every stroked path, convert to segments, save debug
@@ -543,14 +542,14 @@ def step3_snap_open_to_hits(
     out_dir: Path,
     stem: str,
     join_radius: float = 5.0,
+    path_snap_radius: float = 1.0,
 ):
     """
-    Step 3: one-pass join.
-
-    Points = all hit-cluster centroids (any size) + all still-open terminals.
-    Union anything within join_radius. Each group of 2+ snaps to its
-    average. No n>=3 filter.
+    Step 3: one-pass join of hit points + open terminals, then T-join
+    groups of size >= 2 onto a nearby foreign path (path_snap_radius).
     """
+    from shapely.geometry import LineString, Point
+
     work = [[list(s) for s in rec["segments"]] for rec in records]
 
     def set_terminal(pi, is_start, pt):
@@ -564,14 +563,32 @@ def step3_snap_open_to_hits(
     def end_flag(s):
         return s == "start" or s is True
 
-    nodes = []
+    def nearest_on_foreign_paths(pt, skip):
+        """Nearest point on any path whose index is not in skip. Returns (dist, xy) or (None, None)."""
+        p = Point(pt)
+        best_d, best_xy = None, None
+        for pi, segs in enumerate(work):
+            if pi in skip:
+                continue
+            for a, b in segs:
+                if dist(a, b) < 1e-12:
+                    continue
+                ls = LineString([tuple(a), tuple(b)])
+                d = ls.distance(p)
+                if best_d is not None and d >= best_d:
+                    continue
+                proj = ls.interpolate(ls.project(p))
+                best_d = d
+                best_xy = (proj.x, proj.y)
+        return best_d, best_xy
 
-    for hit in hit_points:
+    # --- nodes: every hit + every open terminal (no hit_cluster) ---
+    nodes = []
+    for h in hit_points:
         nodes.append({
             "kind": "hit",
-            "pt": tuple(hit["pt"]),
-            "n": 1,
-            "members": [hit],
+            "pt": h["pt"],
+            "members": [h],
         })
 
     for pi, segs in enumerate(work):
@@ -583,12 +600,10 @@ def step3_snap_open_to_hits(
             nodes.append({
                 "kind": "open",
                 "pt": pt,
-                "n": 1,
                 "pi": pi,
                 "is_start": is_start,
             })
 
-    # --- union-find nodes within join_radius ---
     parent = list(range(len(nodes)))
 
     def find(i):
@@ -613,40 +628,56 @@ def step3_snap_open_to_hits(
 
     events = []
     n_snapped = 0
+    n_path_snaps = 0
 
     for idxs in groups.values():
         if len(idxs) < 2:
             continue
+
         pts = [nodes[i]["pt"] for i in idxs]
         avg = (
             sum(p[0] for p in pts) / len(pts),
             sum(p[1] for p in pts) / len(pts),
         )
 
-        kinds = [nodes[i]["kind"] for i in idxs]
+        skip = set()
+        for i in idxs:
+            nd = nodes[i]
+            if nd["kind"] == "open":
+                skip.add(nd["pi"])
+            else:
+                for m in nd["members"]:
+                    skip.add(m["path"])
+
+        d_path, on_path = nearest_on_foreign_paths(avg, skip)
+        if d_path is not None and d_path <= path_snap_radius:
+            target = on_path
+            n_path_snaps += 1
+            where = f"PATH_SNAP dist={d_path:.3f}"
+        else:
+            target = avg
+            where = "AVG"
+
         events.append(
-            f"GROUP size={len(idxs)}  avg=({avg[0]:.3f},{avg[1]:.3f})  "
-            f"kinds={kinds}"
+            f"GROUP size={len(idxs)}  {where}  "
+            f"target=({target[0]:.3f},{target[1]:.3f})"
         )
 
         for i in idxs:
             nd = nodes[i]
             if nd["kind"] == "open":
-                set_terminal(nd["pi"], nd["is_start"], avg)
+                set_terminal(nd["pi"], nd["is_start"], target)
                 n_snapped += 1
                 events.append(
                     f"  SNAP open  path={nd['pi']}  "
-                    f"end={'start' if nd['is_start'] else 'end'}  "
-                    f"from=({nd['pt'][0]:.3f},{nd['pt'][1]:.3f})"
+                    f"end={'start' if nd['is_start'] else 'end'}"
                 )
             else:
                 for m in nd["members"]:
-                    set_terminal(m["path"], end_flag(m["end"]), avg)
+                    set_terminal(m["path"], end_flag(m["end"]), target)
                     n_snapped += 1
                 events.append(
-                    f"  SNAP hit-cluster n={nd['n']}  "
-                    f"from=({nd['pt'][0]:.3f},{nd['pt'][1]:.3f})  "
-                    f"paths={[m['path'] for m in nd['members']]}"
+                    f"  SNAP hit  paths={[m['path'] for m in nd['members']]}"
                 )
 
     out_records = []
@@ -663,13 +694,14 @@ def step3_snap_open_to_hits(
     n_open = sum(1 for nd in nodes if nd["kind"] == "open")
     summary_path = out_dir / f"{stem}_step3_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("STEP 3 – join hit points + open terminals (one pass, any size)\n")
-        f.write(f"  join_radius   : {join_radius}\n")
-        f.write(f"  hit_points    : {len(hit_points)}\n")
-        f.write(f"  hit nodes     : {sum(1 for nd in nodes if nd['kind']=='hit')}\n")
-        f.write(f"  open terminals: {n_open}\n")
-        f.write(f"  groups >=2    : {sum(1 for v in groups.values() if len(v)>=2)}\n")
-        f.write(f"  snaps         : {n_snapped}\n")
+        f.write("STEP 3 – join hits+opens, T-join groups>=2 onto paths\n")
+        f.write(f"  join_radius      : {join_radius}\n")
+        f.write(f"  path_snap_radius : {path_snap_radius}\n")
+        f.write(f"  hit_points       : {len(hit_points)}\n")
+        f.write(f"  open terminals   : {n_open}\n")
+        f.write(f"  groups >=2       : {sum(1 for v in groups.values() if len(v)>=2)}\n")
+        f.write(f"  path snaps       : {n_path_snaps}\n")
+        f.write(f"  snaps            : {n_snapped}\n")
         f.write("\nEvents:\n")
         if events:
             for line in events:
@@ -916,7 +948,7 @@ def _draw_faces_debug(faces, out_path: Path):
             fontsize=9, va="top",
             bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3))
     plt.tight_layout()
-    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close()
 
 def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title: str):
@@ -955,7 +987,7 @@ def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title
     )
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close()
 
 
@@ -1005,7 +1037,7 @@ def _draw_step2_debug(original_records, extended_records, page_bbox, out_path, e
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
     plt.tight_layout()
-    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close()
 
 def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
@@ -1066,9 +1098,320 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
     plt.tight_layout()
-    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close()
 
+
+# ------------------------------------------------------------------
+# INTERACTIVE FACE SELECTOR  (v2 – faster, per-piece colours, start selected)
+# ------------------------------------------------------------------
+
+class FaceSelector:
+    def __init__(self, page, faces_per_piece, assembled=None,
+                 title="Select faces – click to toggle"):
+        self.faces_per_piece = faces_per_piece
+        self.done = False
+        self.cancelled = False
+
+        # Flatten
+        self.flat_faces = []          # (piece_idx, face_idx, face_dict)
+        for pi, faces in faces_per_piece:
+            for fi, face in enumerate(faces):
+                self.flat_faces.append((pi, fi, face))
+
+        # Start with EVERYTHING selected
+        self.selected = {(pi, fi) for pi, fi, _ in self.flat_faces}
+
+        # One stable colour per pattern piece
+        n_pieces = max((pi for pi, _, _ in self.flat_faces), default=0) + 1
+        try:
+            # Matplotlib ≥ 3.7
+            cmap = mpl.colormaps["tab20"]
+        except (AttributeError, KeyError):
+            # Fallback for older versions
+            cmap = plt.cm.get_cmap("tab20")
+
+        self.piece_colors = {pi: cmap(pi % 20) for pi in range(max(n_pieces, 1))}
+        # ---- figure ----
+        if assembled is not None:
+            global_rect = assembled["global_rect"]
+            fig_w = 16
+            fig_h = max(8.0, fig_w * global_rect.height / max(global_rect.width, 1.0))
+            self.fig, self.ax = plt.subplots(figsize=(fig_w, fig_h))
+            self.ax.set_xlim(global_rect.x0 - 10, global_rect.x1 + 10)
+            self.ax.set_ylim(global_rect.y1 + 10, global_rect.y0 - 10)
+        else:
+            page_rect = page.rect
+            self.fig, self.ax = plt.subplots(
+                figsize=(12, 12 * page_rect.height / page_rect.width)
+            )
+            self.ax.set_xlim(page_rect.x0, page_rect.x1)
+            self.ax.set_ylim(page_rect.y1, page_rect.y0)
+
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height, pix.width, 3
+            )
+            self.ax.imshow(
+                img,
+                extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
+                alpha=0.35,
+                zorder=0,
+            )
+
+        self.ax.set_aspect("equal")
+        self.ax.axis("off")
+
+        # Title higher up and smaller so it doesn’t cover content
+        self.ax.set_title(title, pad=2, fontsize=11)
+
+        # Create patches ONCE
+        self.patches = {}          # (pi, fi) → MplPolygon
+        self.labels  = {}          # (pi, fi) → text artist
+
+        # artists that show the combined outline of each piece
+        self.combined_outlines = {}   # piece_idx → LineCollection or list of plots    
+
+        for pi, fi, face in self.flat_faces:
+            color = self.piece_colors[pi]
+
+            poly = MplPolygon(
+                face["points"],
+                closed=True,
+                facecolor=color,
+                edgecolor="0.45",      # same as _update_face_style
+                linewidth=0.7,         # same as selected state
+                alpha=0.62,            # same as selected state
+                zorder=3,
+                picker=False,
+            )
+            self.ax.add_patch(poly)
+            self.patches[(pi, fi)] = poly
+
+            # # label
+            # cx = sum(p[0] for p in face["points"]) / len(face["points"])
+            # cy = sum(p[1] for p in face["points"]) / len(face["points"])
+            # txt = self.ax.text(
+            #     cx, cy, f"{pi}.{fi}",
+            #     color="black", fontsize=8, fontweight="bold",
+            #     ha="center", va="center",
+            #     bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1),
+            #     zorder=5,
+            # )
+            # self.labels[(pi, fi)] = txt
+
+        # Make sure every face starts with the correct visual style
+        for pi, fi, _ in self.flat_faces:
+            self._update_face_style(pi, fi)
+
+        # Then draw the combined outlines
+        self._update_all_combined_outlines()
+
+        # Status bar – placed very high and compact
+        self.status = self.ax.text(
+            0.01, 0.995,
+            self._status_text(),
+            transform=self.ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            horizontalalignment="left",
+            bbox=dict(facecolor="white", alpha=0.88, edgecolor="none", pad=3),
+            zorder=10,
+        )
+
+        # events
+        self.cid_click = self.fig.canvas.mpl_connect(
+            "button_press_event", self._on_click
+        )
+        self.cid_key = self.fig.canvas.mpl_connect(
+            "key_press_event", self._on_key
+        )
+
+        # Make layout tighter
+        self.fig.tight_layout(pad=0.4)
+        self.fig.subplots_adjust(top=0.96)   # push title up
+
+    def _update_all_combined_outlines(self):
+        piece_ids = {pi for pi, _, _ in self.flat_faces}
+        for pi in piece_ids:
+            self._update_combined_outline(pi)
+
+    def _compute_combined_polygon(self, piece_idx):
+        """Return the unary union of all currently selected faces of this piece."""
+        from shapely.ops import unary_union
+        polys = []
+        for pi, fi, face in self.flat_faces:
+            if pi == piece_idx and (pi, fi) in self.selected:
+                polys.append(face["polygon"])
+        if not polys:
+            return None
+        try:
+            u = unary_union(polys)
+            if u.is_empty:
+                return None
+            if u.geom_type == "MultiPolygon":
+                # take the largest part (usually there is only one)
+                u = max(u.geoms, key=lambda g: g.area)
+            return u if u.geom_type == "Polygon" else None
+        except Exception:
+            return None
+        
+    def _update_combined_outline(self, piece_idx):
+        """Strong, unmistakable main outline."""
+        # remove previous
+        if piece_idx in self.combined_outlines:
+            arts = self.combined_outlines[piece_idx]
+            if not isinstance(arts, (list, tuple)):
+                arts = [arts]
+            for a in arts:
+                a.remove()
+            del self.combined_outlines[piece_idx]
+
+        poly = self._compute_combined_polygon(piece_idx)
+        if poly is None or poly.exterior is None:
+            return
+
+        coords = list(poly.exterior.coords)
+        xs, ys = zip(*coords)
+
+        # soft glow underneath
+        glow, = self.ax.plot(
+            xs, ys,
+            color="white",
+            linewidth=7.0,
+            solid_capstyle="round",
+            solid_joinstyle="round",
+            alpha=0.45,
+            zorder=6,
+        )
+        # crisp dark core on top
+        core, = self.ax.plot(
+            xs, ys,
+            color="black",
+            linewidth=3.0,
+            solid_capstyle="round",
+            solid_joinstyle="round",
+            alpha=0.95,
+            zorder=7,
+        )
+        self.combined_outlines[piece_idx] = [glow, core]
+
+
+    def _status_text(self):
+        n = len(self.selected)
+        total = len(self.flat_faces)
+        return (f"Selected: {n}/{total}   "
+                f"click=toggle   Enter/d=done   a=all   c=clear   Esc=cancel")
+
+    def _update_face_style(self, pi, fi):
+        """Face edges stay subtle."""
+        poly = self.patches[(pi, fi)]
+        is_sel = (pi, fi) in self.selected
+        color = self.piece_colors[pi]
+
+        poly.set_facecolor(color)
+        poly.set_edgecolor("0.45")          # medium-light grey
+        poly.set_linewidth(0.7 if is_sel else 0.5)
+        poly.set_alpha(0.62 if is_sel else 0.18)
+        poly.set_zorder(3 if is_sel else 2)
+
+    def _on_click(self, event):
+        if event.inaxes != self.ax or event.button != 1:
+            return
+        x, y = event.xdata, event.ydata
+        if x is None or y is None:
+            return
+
+        pt = Point(x, y)
+        for pi, fi, face in reversed(self.flat_faces):
+            if face["polygon"].contains(pt) or face["polygon"].touches(pt):
+                key = (pi, fi)
+                if key in self.selected:
+                    self.selected.remove(key)
+                else:
+                    self.selected.add(key)
+
+                # update only the face that changed + its piece outline
+                self._update_face_style(pi, fi)
+                self._update_combined_outline(pi)
+
+                self.status.set_text(self._status_text())
+                self.fig.canvas.draw_idle()
+                return
+
+    def _on_key(self, event):
+        if event.key in ("enter", "d"):
+            self.done = True
+            plt.close(self.fig)
+        elif event.key == "escape":
+            self.cancelled = True
+            self.selected.clear()
+            plt.close(self.fig)
+        elif event.key == "a":
+            self.selected = {(pi, fi) for pi, fi, _ in self.flat_faces}
+            for pi, fi, _ in self.flat_faces:
+                self._update_face_style(pi, fi)
+            self._update_all_combined_outlines()
+            self.status.set_text(self._status_text())
+            self.fig.canvas.draw_idle()
+        elif event.key == "c":
+            self.selected.clear()
+            for pi, fi, _ in self.flat_faces:
+                self._update_face_style(pi, fi)
+            self._update_all_combined_outlines()
+            self.status.set_text(self._status_text())
+            self.fig.canvas.draw_idle()
+
+    def run(self):
+        plt.show(block=True)
+
+        if self.cancelled:
+            return []
+
+        # ---- build the final combined outlines (what you actually want) ----
+        from collections import defaultdict
+        from shapely.ops import unary_union
+
+        by_piece = defaultdict(list)
+        for pi, fi, face in self.flat_faces:
+            if (pi, fi) in self.selected:
+                by_piece[pi].append(face["polygon"])
+
+        result = []
+        for pi, polys in sorted(by_piece.items()):
+            try:
+                u = unary_union(polys)
+                if u.is_empty:
+                    continue
+                if u.geom_type == "MultiPolygon":
+                    u = max(u.geoms, key=lambda g: g.area)
+                if u.geom_type != "Polygon" or u.exterior is None:
+                    continue
+
+                coords = list(u.exterior.coords)
+                segs = [(coords[i], coords[i+1]) for i in range(len(coords)-1)]
+                result.append({
+                    "segments": segs,
+                    "points": coords[:-1],
+                    "area": float(u.area),
+                    "bbox": u.bounds,
+                    "source_piece": pi,
+                    "closed": True,
+                    # keep empty for compatibility with write_patterns_txt / render
+                    "size_variants": [],
+                    "path_ids": [],          # no longer meaningful
+                    "perimeter": float(u.length),
+                })
+            except Exception:
+                continue
+
+        return result
+
+
+def select_faces_interactive(page, faces_per_piece, assembled=None):
+    selector = FaceSelector(page, faces_per_piece, assembled=assembled)
+    return selector.run()
+    
 
 def main():
     parser = argparse.ArgumentParser(description="Step 1: read PDF paths as-is")
@@ -1115,7 +1458,7 @@ def main():
             page,
             out_dir=out_dir,
             stem=page_stem,
-            min_segment_length=args.min_seg_length,
+            min_segment_length=2.0,
         )
         print(f"  paths={len(records)}  segments={len(all_segments)}")
 
@@ -1135,7 +1478,8 @@ def main():
             hit_points,
             out_dir=out_dir,
             stem=page_stem,
-            join_radius=0.0,
+            join_radius=10.0,
+            path_snap_radius=2.0,
         )
         print(f"  step3 segments={len(junc_segments)}")
 
@@ -1144,7 +1488,7 @@ def main():
             junc_records,
             out_dir=out_dir,
             stem=page_stem,
-            snap_tol=0.05,   # float noise only; try 0.01–0.1
+            snap_tol=0.1,   # float noise only; try 0.01–0.1
         )
         print(f"  step4 noded segments={len(noded_segments)}")        
 
@@ -1153,6 +1497,18 @@ def main():
             noded, out_dir, page_stem, min_face_area=400.0,
         )
         print(f"  step5 faces={len(faces)}")
+
+    faces_per_piece = group_faces_into_pieces(faces)
+    print(f"  pieces={len(faces_per_piece)}")
+    for pi, fl in faces_per_piece:
+        print(f"    piece {pi}: {len(fl)} face(s)")
+
+    print("\n=== Interactive face selection ===")
+    print("Click faces to toggle.  Enter/d=done  a=all  c=clear  Esc=cancel")
+    selected = select_faces_interactive(page, faces_per_piece)
+    print(f"Selected outlines: {len(selected)}")
+    for i, p in enumerate(selected):
+        print(f"  [{i}] area={p['area']:.0f}  peri={p['perimeter']:.0f}")
 
     doc.close()
     print("\nDone. Check the Step 1 PNG and summary txt.")
