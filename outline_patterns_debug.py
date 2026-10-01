@@ -22,6 +22,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
+import matplotlib as mpl
+from matplotlib.patches import Polygon as MplPolygon
+from shapely.geometry import Point
+from shapely.ops import polygonize, unary_union
+
 # Helpers
 def dist(a, b):
     """Euclidean distance between two (x, y) points."""
@@ -792,6 +797,127 @@ def step4_snap_and_union(
 
     return noded, noded_segments
 
+def step5_polygonize(noded, out_dir: Path, stem: str, min_face_area: float = 400.0):
+    """
+    Step 5: turn noded linework into closed faces (Shapely polygonize).
+    Each face is a dict with 'polygon', 'points', 'area', 'bbox'.
+    """
+    if noded is None or noded.is_empty:
+        print("Step 5: empty noded geometry")
+        return []
+
+    raw = list(polygonize(noded))
+    faces = []
+    rejected = 0
+    for poly in raw:
+        if poly is None or poly.is_empty:
+            rejected += 1
+            continue
+        if poly.geom_type != "Polygon":
+            continue
+        if poly.area < min_face_area:
+            rejected += 1
+            continue
+        coords = list(poly.exterior.coords)
+        faces.append({
+            "polygon": poly,
+            "points": coords[:-1],
+            "area": float(poly.area),
+            "bbox": poly.bounds,
+            "perimeter": float(poly.length),
+        })
+    faces.sort(key=lambda f: f["area"], reverse=True)
+
+    summary_path = out_dir / f"{stem}_step5_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("STEP 5 – polygonize\n")
+        f.write(f"  raw faces     : {len(raw)}\n")
+        f.write(f"  min_face_area : {min_face_area}\n")
+        f.write(f"  kept          : {len(faces)}\n")
+        f.write(f"  rejected      : {rejected}\n")
+        for i, face in enumerate(faces[:30]):
+            f.write(f"  [{i}] area={face['area']:.0f}  peri={face['perimeter']:.1f}  "
+                    f"pts={len(face['points'])}  bbox={face['bbox']}\n")
+        if len(faces) > 30:
+            f.write(f"  … and {len(faces) - 30} more\n")
+    print(f"Step 5 summary → {summary_path}")
+
+    png_path = out_dir / f"{stem}_step5_faces.png"
+    _draw_faces_debug(faces, png_path)
+    print(f"Step 5 image   → {png_path}")
+    return faces
+
+
+def group_faces_into_pieces(faces, min_shared_edge: float = 1.0):
+    """
+    Faces that share a real edge belong to the same pattern piece.
+    Returns faces_per_piece: list of (piece_idx, [face, ...]) for FaceSelector.
+    """
+    n = len(faces)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            gi, gj = faces[i]["polygon"], faces[j]["polygon"]
+            if not gi.touches(gj):
+                continue
+            try:
+                inter = gi.intersection(gj)
+            except Exception:
+                continue
+            if inter.length >= min_shared_edge:
+                union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    faces_per_piece = []
+    for pi, idxs in enumerate(sorted(groups.values(),
+                                     key=lambda ix: -sum(faces[k]["area"] for k in ix))):
+        faces_per_piece.append((pi, [faces[k] for k in idxs]))
+    return faces_per_piece
+
+
+def _draw_faces_debug(faces, out_path: Path):
+    if not faces:
+        return
+    xs0, ys0, xs1, ys1 = zip(*[f["bbox"] for f in faces])
+    x0, y0, x1, y1 = min(xs0), min(ys0), max(xs1), max(ys1)
+    w, h = max(x1 - x0, 1.0), max(y1 - y0, 1.0)
+    fig, ax = plt.subplots(figsize=(14, max(6.0, 14 * h / w)))
+    ax.set_xlim(x0 - 20, x1 + 20)
+    ax.set_ylim(y1 + 20, y0 - 20)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title("STEP 5 – polygonize faces", fontsize=11)
+    try:
+        cmap = mpl.colormaps["tab20"]
+    except (AttributeError, KeyError):
+        cmap = plt.cm.get_cmap("tab20")
+    for i, face in enumerate(faces):
+        ax.add_patch(MplPolygon(
+            face["points"], closed=True,
+            facecolor=cmap(i % 20), edgecolor="0.2",
+            linewidth=0.6, alpha=0.55,
+        ))
+    ax.text(0.01, 0.99, f"faces={len(faces)}", transform=ax.transAxes,
+            fontsize=9, va="top",
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3))
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close()
 
 def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title: str):
     """Draw every path in a cycling colour for visual inspection."""
@@ -901,9 +1027,24 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
         lc = LineCollection(noded_segments, colors=["0.15"], linewidths=1.0, alpha=0.9)
         ax.add_collection(lc)
 
+        seen = set()
+        xs, ys = [], []
+        for a, b in noded_segments:
+            for p in (a, b):
+                k = (round(p[0], 3), round(p[1], 3))
+                if k in seen:
+                    continue
+                seen.add(k)
+                xs.append(p[0])
+                ys.append(p[1])
+        ax.scatter(xs, ys, s=12, c="red", zorder=5, linewidths=0)
+        node_count = len(xs)
+    else:
+        node_count = 0
+
     ax.text(
         0.01, 0.99,
-        f"noded segments={len(noded_segments)}  snap_tol={snap_tol}",
+        f"noded segments={len(noded_segments)}  nodes={node_count}  snap_tol={snap_tol}",
         transform=ax.transAxes, fontsize=9, va="top",
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
@@ -977,7 +1118,7 @@ def main():
             hit_points,
             out_dir=out_dir,
             stem=page_stem,
-            join_radius=5.0,
+            join_radius=2.0,
         )
         print(f"  step3 segments={len(junc_segments)}")
 
@@ -989,6 +1130,12 @@ def main():
             snap_tol=0.05,   # float noise only; try 0.01–0.1
         )
         print(f"  step4 noded segments={len(noded_segments)}")        
+
+        # ----- STEP 5 - Polygonize -----
+        faces = step5_polygonize(
+            noded, out_dir, page_stem, min_face_area=400.0,
+        )
+        print(f"  step5 faces={len(faces)}")
 
     doc.close()
     print("\nDone. Check the Step 1 PNG and summary txt.")
