@@ -1027,20 +1027,37 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
         lc = LineCollection(noded_segments, colors=["0.15"], linewidths=1.0, alpha=0.9)
         ax.add_collection(lc)
 
-        seen = set()
-        xs, ys = [], []
+        # degree of each snapped node
+        q = 3  # round to 0.001
+        deg = defaultdict(int)
+        pos = {}
         for a, b in noded_segments:
-            for p in (a, b):
-                k = (round(p[0], 3), round(p[1], 3))
-                if k in seen:
-                    continue
-                seen.add(k)
-                xs.append(p[0])
-                ys.append(p[1])
-        ax.scatter(xs, ys, s=12, c="red", zorder=5, linewidths=0)
-        node_count = len(xs)
+            if dist(a, b) < 1e-12:
+                continue
+            ka = (round(a[0], q), round(a[1], q))
+            kb = (round(b[0], q), round(b[1], q))
+            deg[ka] += 1
+            deg[kb] += 1
+            pos[ka] = a
+            pos[kb] = b
+
+        d1 = [pos[k] for k, d in deg.items() if d == 1]
+        d3 = [pos[k] for k, d in deg.items() if d >= 3]
+        # degree-2 vertices omitted on purpose (just samples along a stroke)
+
+        if d1:
+            xs, ys = zip(*d1)
+            ax.scatter(xs, ys, s=28, c="red", zorder=6, linewidths=0, label="dangle (deg 1)")
+        if d3:
+            xs, ys = zip(*d3)
+            ax.scatter(xs, ys, s=22, c="lime", zorder=6, linewidths=0.3,
+                       edgecolors="black", label="junction (deg 3+)")
+
+        node_count = len(deg)
+        n_dangle = len(d1)
+        n_junc = len(d3)
     else:
-        node_count = 0
+        node_count = n_dangle = n_junc = 0
 
     ax.text(
         0.01, 0.99,
@@ -1118,7 +1135,7 @@ def main():
             hit_points,
             out_dir=out_dir,
             stem=page_stem,
-            join_radius=2.0,
+            join_radius=0.0,
         )
         print(f"  step3 segments={len(junc_segments)}")
 
