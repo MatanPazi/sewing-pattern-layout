@@ -948,7 +948,7 @@ def _draw_faces_debug(faces, out_path: Path):
             fontsize=9, va="top",
             bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3))
     plt.tight_layout()
-    plt.savefig(out_path, dpi=600, bbox_inches="tight")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title: str):
@@ -987,7 +987,7 @@ def _draw_segments_debug(all_segments, records, page_rect, out_path: Path, title
     )
 
     plt.tight_layout()
-    plt.savefig(out_path, dpi=600, bbox_inches="tight")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
@@ -1037,7 +1037,7 @@ def _draw_step2_debug(original_records, extended_records, page_bbox, out_path, e
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
     plt.tight_layout()
-    plt.savefig(out_path, dpi=600, bbox_inches="tight")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
@@ -1098,7 +1098,7 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
     plt.tight_layout()
-    plt.savefig(out_path, dpi=600, bbox_inches="tight")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
