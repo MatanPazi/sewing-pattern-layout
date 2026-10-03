@@ -545,8 +545,22 @@ def step3_snap_open_to_hits(
     path_snap_radius: float = 1.0,
 ):
     """
-    Step 3: one-pass join of hit points + open terminals, then T-join
-    groups of size >= 2 onto a nearby foreign path (path_snap_radius).
+    Step 3: resolve nearby hit points and open path terminals into
+    common junctions.
+
+    Hit points produced by Step 2 and currently open path terminals are
+    treated as connection candidates. Candidates within `join_radius`
+    are grouped together. For each group of two or more candidates:
+
+      1. Compute the group's average position.
+      2. Exclude all paths already represented by the group.
+      3. If the average position is within `path_snap_radius` of another
+         path, use the nearest point on that foreign path as the junction.
+         The target may lie anywhere along the path, not necessarily at
+         a terminal or vertex.
+      4. Otherwise, use the group's average position as the junction.
+      5. Move all participating hit/open terminals to the resulting
+         junction.
     """
     from shapely.geometry import LineString, Point
 
@@ -694,7 +708,7 @@ def step3_snap_open_to_hits(
     n_open = sum(1 for nd in nodes if nd["kind"] == "open")
     summary_path = out_dir / f"{stem}_step3_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("STEP 3 – join hits+opens, T-join groups>=2 onto paths\n")
+        f.write("STEP 3 – resolve nearby hit/open candidates into junctions\n")
         f.write(f"  join_radius      : {join_radius}\n")
         f.write(f"  path_snap_radius : {path_snap_radius}\n")
         f.write(f"  hit_points       : {len(hit_points)}\n")
