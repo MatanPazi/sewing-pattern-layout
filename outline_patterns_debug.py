@@ -192,21 +192,33 @@ def step2_extend_to_first_hit(
     records,
     out_dir: Path,
     stem: str,
-    max_extension: float = 12.0,
+    max_extension: float = 15.0,
     hit_eps: float = 0.1,
     past_hit: float = 0.05,
     max_rounds: int = 5,
     lateral_tol: float = 1.0,
 ):
     """
-    Step 2: each terminal extends at most once, to its nearest hit.
+    Step 2 – close small gaps by growing path ends, without shooting past each other.
 
-    Speed notes
-    -----------
-    - Proximity tests use path terminals only (not every vertex).
-    - Foreign segments and terminals are bucketed in a grid so each ray
-      only tests nearby geometry.
-    - Multi-round, but default max_rounds=3.
+    Each path end that is still free looks forward along its last segment
+    (up to max_extension) and takes the nearest of:
+      • a crossing with another path's stroke
+      • another path end sitting in a narrow tube ahead (dashed / almost collinear)
+      • another free end whose own look-ahead meets this one (a corner)
+
+    Two cases:
+
+    1. Two ends see each other (A finds B and B finds A, they face one
+       another, and they are close enough to reach).
+       That is one join. Both ends are moved to the midpoint of the gap.
+       Neither is allowed to keep growing onto the other's original line
+
+    2. One end hits a stroke that is not looking back (a T).
+       Only that end is grown to the hit, slightly past it so union can node.
+
+    Repeat for a few rounds so C can meet A after A has moved.
+    Ends that already joined are not grown again.
     """
     from shapely.geometry import LineString, Point
 
@@ -239,22 +251,35 @@ def step2_extend_to_first_hit(
 
     def nearby_keys(x, y, cell, radius_cells):
         cx, cy = int(x // cell), int(y // cell)
-        out = []
-        for dx in range(-radius_cells, radius_cells + 1):
-            for dy in range(-radius_cells, radius_cells + 1):
-                out.append((cx + dx, cy + dy))
-        return out
+        return [(cx + dx, cy + dy)
+                for dx in range(-radius_cells, radius_cells + 1)
+                for dy in range(-radius_cells, radius_cells + 1)]
+
+    def other_paths(cand, self_key):
+        """Path indices this candidate connected to, excluding self."""
+        if cand[0] in ("seg", "prox"):
+            return {cand[4]}
+        k1, k2 = cand[2], cand[4]
+        return {k1[0], k2[0]} - {self_key[0]}
 
     work = [[list(s) for s in rec["segments"]] for rec in records]
     applied = set()
-    n_seg = n_ray = n_prox = 0
+    n_seg = n_ray = n_prox = n_mutual = 0
     extension_lengths = []
     round_log = []
-    hit_points = []   # destinations of successful extensions
+    hit_points = []
 
-    # grid cell ~ max_extension so one ring of neighbours covers the ray
     cell = max(max_extension, 4.0)
     radius_cells = 1
+
+    def set_terminal(key, pt):
+        pi, is_start = key
+        if not work[pi]:
+            return
+        if is_start:
+            work[pi][0][0] = pt
+        else:
+            work[pi][-1][1] = pt
 
     for rnd in range(max_rounds):
         terminals = {}
@@ -274,25 +299,18 @@ def step2_extend_to_first_hit(
             round_log.append(f"  round {rnd+1}: no free terminals")
             break
 
-        # --- grid of foreign segments ---
-        seg_grid = defaultdict(list)  # cell -> list of (path_idx, LineString)
+        seg_grid = defaultdict(list)
         for pi, segs in enumerate(work):
             for a, b in segs:
                 if dist(a, b) <= 1e-12:
                     continue
                 ls = LineString([a, b])
-                # index by cells covered by bbox of segment
                 x0, y0 = min(a[0], b[0]), min(a[1], b[1])
                 x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-                cx0, cy0 = int(x0 // cell), int(y0 // cell)
-                cx1, cy1 = int(x1 // cell), int(y1 // cell)
-                for cx in range(cx0, cx1 + 1):
-                    for cy in range(cy0, cy1 + 1):
+                for cx in range(int(x0 // cell), int(x1 // cell) + 1):
+                    for cy in range(int(y0 // cell), int(y1 // cell) + 1):
                         seg_grid[(cx, cy)].append((pi, ls))
 
-        # --- path terminals only (deduped) for proximity ---
-        # list of (path_idx, point); grid of same
-        term_pts = []
         term_grid = defaultdict(list)
         seen_term_pt = set()
         for pi, segs in enumerate(work):
@@ -303,12 +321,10 @@ def step2_extend_to_first_hit(
                 if sp in seen_term_pt:
                     continue
                 seen_term_pt.add(sp)
-                term_pts.append(sp)
                 term_grid[cell_key(pt[0], pt[1], cell)].append(sp)
 
         candidates = []
 
-        # ---- ray vs segments (grid-limited) + proximity (terminals only) ----
         for key, (origin, direction) in terminals.items():
             pi = key[0]
             tip = (
@@ -316,15 +332,13 @@ def step2_extend_to_first_hit(
                 origin[1] + direction[1] * max_extension,
             )
             ray = LineString([origin, tip])
-
-            # cells along the ray bbox
             rx0, ry0 = min(origin[0], tip[0]), min(origin[1], tip[1])
             rx1, ry1 = max(origin[0], tip[0]), max(origin[1], tip[1])
             cx0, cy0 = int(rx0 // cell), int(ry0 // cell)
             cx1, cy1 = int(rx1 // cell), int(ry1 // cell)
 
-            best_t, best_pt = None, None
-            tested_seg = set()  # id(LineString) or (pi, id) avoid retest
+            best_t, best_pt, best_other = None, None, None
+            tested_seg = set()
             for cx in range(cx0 - radius_cells, cx1 + radius_cells + 1):
                 for cy in range(cy0 - radius_cells, cy1 + radius_cells + 1):
                     for other_pi, other_ls in seg_grid.get((cx, cy), []):
@@ -346,6 +360,7 @@ def step2_extend_to_first_hit(
                         elif inter.geom_type == "MultiPoint":
                             points = list(inter.geoms)
                         elif inter.geom_type == "LineString":
+                            # collinear overlap: nearest point on the overlap, not the far end
                             c = list(inter.coords)
                             points = [Point(c[0]), Point(c[-1])]
                         elif inter.geom_type == "GeometryCollection":
@@ -359,14 +374,14 @@ def step2_extend_to_first_hit(
                             if best_t is None or t < best_t:
                                 best_t = t
                                 best_pt = (
-                                    origin[0] + direction[0] * (t + past_hit),
-                                    origin[1] + direction[1] * (t + past_hit),
+                                    origin[0] + direction[0] * t,
+                                    origin[1] + direction[1] * t,
                                 )
+                                best_other = other_pi
             if best_t is not None:
-                candidates.append(("seg", best_t, key, best_pt))
+                candidates.append(("seg", best_t, key, best_pt, best_other))
 
-            # proximity: only nearby path terminals
-            best_pt_t, best_pt_pt = None, None
+            best_pt_t, best_pt_pt, best_pt_other = None, None, None
             tested_pt = set()
             for ck in nearby_keys(origin[0], origin[1], cell, radius_cells + 1):
                 for other_pi, pt in term_grid.get(ck, []):
@@ -381,27 +396,23 @@ def step2_extend_to_first_hit(
                     if best_pt_t is None or t < best_pt_t:
                         best_pt_t = t
                         best_pt_pt = (
-                            origin[0] + direction[0] * (t + past_hit),
-                            origin[1] + direction[1] * (t + past_hit),
+                            origin[0] + direction[0] * t,
+                            origin[1] + direction[1] * t,
                         )
+                        best_pt_other = other_pi
             if best_pt_t is not None:
-                candidates.append(("prox", best_pt_t, key, best_pt_pt))
+                candidates.append(("prox", best_pt_t, key, best_pt_pt, best_pt_other))
 
-        # ---- ray vs ray (only free terminals; still O(m^2) in m free ends) ----
         keys = list(terminals.keys())
         seen = set()
         for i, k1 in enumerate(keys):
             o1, d1 = terminals[k1]
-            # only pair with terminals in nearby cells
-            near_keys = set()
-            for ck in nearby_keys(o1[0], o1[1], cell, radius_cells + 1):
-                near_keys.add(ck)
+            near_keys = set(nearby_keys(o1[0], o1[1], cell, radius_cells + 1))
             for k2 in keys[i + 1:]:
                 if k2[0] == k1[0]:
                     continue
                 o2, d2 = terminals[k2]
                 if cell_key(o2[0], o2[1], cell) not in near_keys:
-                    # also allow if o2 is along ray within max_extension bbox
                     if dist(o1, o2) > max_extension * 1.5:
                         continue
                 hit = ray_ray_intersection(o1, d1, o2, d2)
@@ -414,43 +425,86 @@ def step2_extend_to_first_hit(
                 seen.add(pair)
                 candidates.append(("ray", min(t1, t2), k1, t1, k2, t2, p))
 
-        # best per terminal: seg/ray first; prox only if no geometric hit
         best_for = {}
         has_geom = defaultdict(bool)
-
-        # best per terminal (seg, ray, prox all compete — smallest t wins)
-        best_for = {}
         for cand in candidates:
-            if cand[0] in ("seg", "prox"):
-                _, t, key, pt = cand
+            if cand[0] == "seg":
+                _, t, key, pt, _ = cand
+                has_geom[key] = True
                 if key not in best_for or t < best_for[key][0]:
                     best_for[key] = (t, cand)
-            else:
+            elif cand[0] == "ray":
                 _, _, k1, t1, k2, t2, p = cand
+                has_geom[k1] = True
+                has_geom[k2] = True
                 if k1 not in best_for or t1 < best_for[k1][0]:
                     best_for[k1] = (t1, cand)
                 if k2 not in best_for or t2 < best_for[k2][0]:
                     best_for[k2] = (t2, cand)
+        for cand in candidates:
+            if cand[0] != "prox":
+                continue
+            _, t, key, pt, _ = cand
+            if has_geom[key]:
+                continue
+            if key not in best_for or t < best_for[key][0]:
+                best_for[key] = (t, cand)
 
-        def set_terminal(key, pt):
-            pi, is_start = key
-            if not work[pi]:
-                return
-            if is_start:
-                work[pi][0][0] = pt
-            else:
-                work[pi][-1][1] = pt
+        def find_partner(key, cand):
+            o1, d1 = terminals[key]
+            for opi in other_paths(cand, key):
+                for st in (True, False):
+                    k2 = (opi, st)
+                    if k2 not in best_for or k2 == key:
+                        continue
+                    if key[0] not in other_paths(best_for[k2][1], k2):
+                        continue
+                    o2, d2 = terminals[k2]
+                    if dist(o1, o2) > max_extension:
+                        continue
+                    # both must be looking toward each other
+                    if (o2[0] - o1[0]) * d1[0] + (o2[1] - o1[1]) * d1[1] <= 0:
+                        continue
+                    if (o1[0] - o2[0]) * d2[0] + (o1[1] - o2[1]) * d2[1] <= 0:
+                        continue
+                    return k2
+            return None
 
         applied_this_round = 0
+
+        # ---- 1. mutual pairs: one point for both ----
+        for key, (t, cand) in sorted(best_for.items(), key=lambda kv: kv[1][0]):
+            if key in applied:
+                continue
+            partner = find_partner(key, cand)
+            if partner is None or partner in applied:
+                continue
+            o1 = terminals[key][0]
+            o2 = terminals[partner][0]
+            mid = ((o1[0] + o2[0]) * 0.5, (o1[1] + o2[1]) * 0.5)
+            set_terminal(key, mid)
+            set_terminal(partner, mid)
+            hit_points.append({"pt": mid, "path": key[0], "end": "start" if key[1] else "end"})
+            hit_points.append({"pt": mid, "path": partner[0], "end": "start" if partner[1] else "end"})
+            applied.add(key)
+            applied.add(partner)
+            applied_this_round += 1
+            n_mutual += 1
+            extension_lengths.append(dist(o1, mid))
+            extension_lengths.append(dist(o2, mid))
+
+        # ---- 2. leftover unpaired (true T onto someone else's stroke) ----
         for key, (t, cand) in sorted(best_for.items(), key=lambda kv: kv[1][0]):
             if key in applied:
                 continue
             if cand[0] in ("seg", "prox"):
-                _, t, k, pt = cand
+                _, t, k, pt, _ = cand
                 if k in applied:
                     continue
-                set_terminal(k, pt)
-                hit_points.append({"pt": tuple(pt), "path": k[0], "end": "start" if k[1] else "end"})
+                o, d = terminals[k]
+                pt2 = (o[0] + d[0] * (t + past_hit), o[1] + d[1] * (t + past_hit))
+                set_terminal(k, pt2)
+                hit_points.append({"pt": tuple(pt2), "path": k[0], "end": "start" if k[1] else "end"})
                 applied.add(k)
                 applied_this_round += 1
                 extension_lengths.append(t)
@@ -466,14 +520,10 @@ def step2_extend_to_first_hit(
                     continue
                 if best_for.get(k2, (None,))[1] is not cand:
                     continue
-                o1, d1 = terminals[k1]
-                o2, d2 = terminals[k2]
-                p1 = (o1[0] + d1[0] * (t1 + past_hit), o1[1] + d1[1] * (t1 + past_hit))
-                p2 = (o2[0] + d2[0] * (t2 + past_hit), o2[1] + d2[1] * (t2 + past_hit))
-                set_terminal(k1, p1)
-                set_terminal(k2, p2)
-                hit_points.append({"pt": tuple(p1), "path": k1[0], "end": "start" if k1[1] else "end"})
-                hit_points.append({"pt": tuple(p2), "path": k2[0], "end": "start" if k2[1] else "end"})
+                set_terminal(k1, p)
+                set_terminal(k2, p)
+                hit_points.append({"pt": tuple(p), "path": k1[0], "end": "start" if k1[1] else "end"})
+                hit_points.append({"pt": tuple(p), "path": k2[0], "end": "start" if k2[1] else "end"})
                 applied.add(k1)
                 applied.add(k2)
                 applied_this_round += 1
@@ -483,7 +533,7 @@ def step2_extend_to_first_hit(
 
         round_log.append(
             f"  round {rnd+1}: free={len(terminals)}  cand={len(candidates)}  "
-            f"applied={applied_this_round}"
+            f"applied={applied_this_round}  mutual={n_mutual}"
         )
         if applied_this_round == 0:
             break
@@ -502,10 +552,11 @@ def step2_extend_to_first_hit(
     summary_path = out_dir / f"{stem}_step2_summary.txt"
     bbox = segments_bbox(all_segments)
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("STEP 2 – multi-round nearest hit (grid + terminal prox)\n")
+        f.write("STEP 2 – nearest hit; mutual pairs meet at midpoint\n")
         f.write(f"  max_extension     : {max_extension}\n")
         f.write(f"  lateral_tol       : {lateral_tol}\n")
         f.write(f"  max_rounds        : {max_rounds}\n")
+        f.write(f"  mutual pair joins : {n_mutual}\n")
         f.write(f"  segment-hit joins : {n_seg}\n")
         f.write(f"  ray–ray joins     : {n_ray}\n")
         f.write(f"  proximity joins   : {n_prox}\n")
@@ -1481,7 +1532,7 @@ def main():
             records,
             out_dir=out_dir,
             stem=page_stem,
-            max_extension=12.0,
+            max_extension=15.0,
         )
         print(f"  step2  extended_ends={len(applied)}  hit_points={len(hit_points)}")
 
