@@ -7,7 +7,7 @@ Read stroked paths from a PDF page and draw them exactly as they are
 so you can verify the raw geometry before any later processing.
 
 How to run:
-python outline_patterns_debug.py --pdf /path/to/your.pdf --pages 0
+python outline_patterns_debug.py --pattern-pdf PAT.pdf --lines-pdf LINES.pdf --pattern-pages 0-3 --lines-pages 0-3
 """
 
 from __future__ import annotations
@@ -26,6 +26,279 @@ import matplotlib as mpl
 from matplotlib.patches import Polygon as MplPolygon
 from shapely.geometry import Point
 from shapely.ops import polygonize, unary_union
+
+
+# ------------------------------------------------------------------
+# Multi-page assembly helpers
+# ------------------------------------------------------------------
+
+class AssembledPage:
+    """Minimal page-like object so the existing detect_* functions keep working."""
+    def __init__(self, paths, rect):
+        self._paths = paths
+        self.rect = rect
+        self.mediabox = rect
+        self.cropbox = rect
+        self.rotation = 0
+
+    def get_drawings(self):
+        return self._paths
+
+def _find_large_rectangles(page, min_area_ratio=0.55, min_side_ratio=0.60):
+    """
+    Return list of candidate content rectangles on a page.
+    Prefers a single 're' operator; also accepts 4-line rectangles.
+    """
+    drawings = page.get_drawings()
+    page_area = page.rect.width * page.rect.height
+    candidates = []
+
+    for path in drawings:
+        items = path.get("items", [])
+        if not items:
+            continue
+
+        # Case 1: pure rectangle operator
+        if len(items) == 1 and items[0][0] == "re":
+            r = items[0][1]
+            w, h = r.width, r.height
+            if (w * h >= min_area_ratio * page_area and
+                w >= min_side_ratio * page.rect.width and
+                h >= min_side_ratio * page.rect.height):
+                candidates.append(fitz.Rect(r))
+            continue
+
+        # Case 2: four long axis-aligned lines that form a rectangle
+        # (simplified but works for most pattern borders)
+        segs = path_to_segments(path)
+        if len(segs) < 4:
+            continue
+        # ... (you can expand this later if needed)
+
+    return candidates
+
+
+def _detect_content_rect(doc, page_numbers):
+    """
+    Look for a large rectangle that exists on *every* page of the given list.
+    Returns the median rectangle (in page coordinates) or None.
+    """
+    if not page_numbers:
+        return None
+
+    all_rects = []
+    for pno in page_numbers:
+        page = doc[pno]
+        rects = _find_large_rectangles(page)
+        if not rects:
+            return None          # must exist on every page
+        # take the largest one on this page
+        largest = max(rects, key=lambda r: r.width * r.height)
+        all_rects.append(largest)
+
+    # All pages have a large rect → check they are similar
+    widths  = [r.width  for r in all_rects]
+    heights = [r.height for r in all_rects]
+    if (max(widths)  - min(widths)  > 8.0 or
+        max(heights) - min(heights) > 8.0):
+        return None
+
+    # Return a representative rectangle (median position + size)
+    med_x0 = float(np.median([r.x0 for r in all_rects]))
+    med_y0 = float(np.median([r.y0 for r in all_rects]))
+    med_w  = float(np.median(widths))
+    med_h  = float(np.median(heights))
+    return fitz.Rect(med_x0, med_y0, med_x0 + med_w, med_y0 + med_h)
+
+
+def assemble_pages(pattern_doc, pattern_pages,
+                   instr_doc, instr_pages,
+                   overlap=0.0):
+    """
+    Assemble multi-page pattern into a single global coordinate system.
+    Returns a dict containing the transformed paths and a correctly sized canvas.
+    """
+    import math
+    import numpy as np
+
+    if not pattern_pages:
+        raise ValueError("No pattern pages given")
+
+    # ------------------------------------------------------------------
+    # 1. Detect content rectangle from the instruction layer
+    # ------------------------------------------------------------------
+    content_rect = _detect_content_rect(instr_doc, instr_pages)
+
+    if content_rect is not None:
+        tile_w = content_rect.width
+        tile_h = content_rect.height
+        print(f"Content rectangle detected: {tile_w:.1f} × {tile_h:.1f}")
+    else:
+        sample = pattern_doc[pattern_pages[0]]
+        tile_w = sample.rect.width
+        tile_h = sample.rect.height
+        content_rect = None
+        print("No consistent content rectangle – using full page size")
+
+    # ------------------------------------------------------------------
+    # 2. Intelligent layout decision based on boundary overflows
+    # ------------------------------------------------------------------
+    n = len(pattern_pages)
+    horizontal_overflow = False
+    vertical_overflow = False
+
+    ref_x0 = content_rect.x0 if content_rect else 0
+    ref_y0 = content_rect.y0 if content_rect else 0
+    ref_x1 = content_rect.x1 if content_rect else tile_w
+    ref_y1 = content_rect.y1 if content_rect else tile_h
+
+    # Scan drawings to see which boundary is crossed
+    for pno in pattern_pages:
+        page = pattern_doc[pno]
+        for path in page.get_drawings():
+            for item in path.get("items", []):
+                op = item[0]
+                pts = []
+                if op == "l":
+                    pts = [item[1], item[2]]
+                elif op == "c":
+                    pts = item[1:]
+                elif op == "re":
+                    r = item[1]
+                    pts = [fitz.Point(r.x0, r.y0), fitz.Point(r.x1, r.y1)]
+                elif op == "qu":
+                    q = item[1]
+                    pts = [q.ul, q.ur, q.lr, q.ll]
+
+                for pt in pts:
+                    p = fitz.Point(pt)
+                    if p.x > ref_x1 + 1.0 or p.x < ref_x0 - 1.0:
+                        horizontal_overflow = True
+                    if p.y > ref_y1 + 1.0 or p.y < ref_y0 - 1.0:
+                        vertical_overflow = True
+
+    # Determine layout orientation based on overflow direction
+    if horizontal_overflow and not vertical_overflow:
+        cols, rows = n, 1
+        print("Detected horizontal extension: arranging pages in a single row")
+    elif vertical_overflow and not horizontal_overflow:
+        cols, rows = 1, n
+        print("Detected vertical extension: arranging pages in a single column")
+    else:
+        # Fallback based on page orientation if overflow is ambiguous or absent
+        sample = pattern_doc[pattern_pages[0]]
+        if sample.rect.width >= sample.rect.height:
+            cols, rows = n, 1
+            print("No clear overflow detected, defaulting to horizontal layout (landscape)")
+        else:
+            cols, rows = 1, n
+            print("No clear overflow detected, defaulting to vertical layout (portrait)")
+
+    print(f"Using grid {rows}×{cols}")
+
+    # ------------------------------------------------------------------
+    # 3. Place every path and collect real bounding box
+    # ------------------------------------------------------------------
+    global_paths = []
+    page_transforms = []
+    all_x = []
+    all_y = []
+
+    for idx, pno in enumerate(pattern_pages):
+        page = pattern_doc[pno]
+        row = idx // cols
+        col = idx % cols
+
+        # Base translation – place tiles next to each other
+        tx = col * (tile_w - overlap)
+        ty = row * (tile_h - overlap)
+
+        # Optional origin shift only if we have a content rect
+        if content_rect is not None:
+            tx -= content_rect.x0
+            ty -= content_rect.y0
+
+        mat = fitz.Matrix(1, 0, 0, 1, tx, ty)
+        page_transforms.append((pno, mat))
+
+        for path in page.get_drawings():
+            new_items = []
+            xs = []
+            ys = []
+
+            for item in path.get("items", []):
+                op = item[0]
+                if op == "l":
+                    p1 = fitz.Point(item[1]) * mat
+                    p2 = fitz.Point(item[2]) * mat
+                    new_items.append(("l", p1, p2))
+                    xs.extend([p1.x, p2.x])
+                    ys.extend([p1.y, p2.y])
+                elif op == "c":
+                    pts = [fitz.Point(p) * mat for p in item[1:]]
+                    new_items.append(("c", *pts))
+                    for p in pts:
+                        xs.append(p.x)
+                        ys.append(p.y)
+                elif op == "re":
+                    r = fitz.Rect(item[1]) * mat
+                    new_items.append(("re", r, item[2] if len(item) > 2 else 1))
+                    xs.extend([r.x0, r.x1])
+                    ys.extend([r.y0, r.y1])
+                elif op == "qu":
+                    q = item[1]
+                    ul = fitz.Point(q.ul) * mat
+                    ur = fitz.Point(q.ur) * mat
+                    lr = fitz.Point(q.lr) * mat
+                    ll = fitz.Point(q.ll) * mat
+                    new_items.append(("l", ul, ur))
+                    new_items.append(("l", ur, lr))
+                    new_items.append(("l", lr, ll))
+                    new_items.append(("l", ll, ul))
+                    xs.extend([ul.x, ur.x, lr.x, ll.x])
+                    ys.extend([ul.y, ur.y, lr.y, ll.y])
+                else:
+                    new_items.append(item)
+
+            # ---- critical: keep a correct rect for this path ----
+            new_path = dict(path)  # preserve width, color, etc.
+            new_path["items"] = new_items
+            if xs and ys:
+                new_path["rect"] = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+            else:
+                # fallback – should rarely happen
+                new_path["rect"] = fitz.Rect(tx, ty, tx + tile_w, ty + tile_h)
+
+            global_paths.append(new_path)
+
+            # also collect for the overall canvas
+            all_x.extend(xs)
+            all_y.extend(ys)
+
+    # ------------------------------------------------------------------
+    # 4. Real bounding box of everything + padding
+    # ------------------------------------------------------------------
+    if not all_x:
+        global_rect = fitz.Rect(0, 0, tile_w, tile_h)
+    else:
+        pad = 30.0
+        global_rect = fitz.Rect(
+            min(all_x) - pad,
+            min(all_y) - pad,
+            max(all_x) + pad,
+            max(all_y) + pad,
+        )
+
+    print(f"Final canvas: {global_rect.width:.1f} × {global_rect.height:.1f}")
+    return {
+        "paths": global_paths,
+        "global_rect": global_rect,
+        "content_rect": content_rect,
+        "tile_w": tile_w,
+        "tile_h": tile_h,
+        "grid": (cols, rows),
+        "page_transforms": page_transforms,
+    }
 
 # Helpers
 def dist(a, b):
@@ -1478,90 +1751,768 @@ def select_faces_interactive(page, faces_per_piece, assembled=None):
     return selector.run()
     
 
+def detect_special_lines(page,
+                         min_shaft_length=20.0,
+                         arrow_search_radius=12.0,
+                         max_arrow_size=35.0,
+                         max_arrow_segments=30,
+                         min_arrow_width=0.7,
+                         point_tol=1.0,
+                         min_crossbar_length=4.0,
+                         max_crossbar_length=90.0,
+                         join_gap=8.0,
+                         collinear_dot_min=0.98,
+                         perp_dot_max=0.35,
+                         min_fold_ends=1):
+    """
+    Unified grain/fold detection from straight runs + arrow sites.
+
+    Grain: long run with arrow(s) near its own endpoints.
+    Fold:  long run with short perpendicular run(s) at end(s)
+           and arrow(s) near the outer end of those short runs.
+
+    Shaft-first: all straight geometry is collected first; arrows are
+    resolved only relative to concrete shafts. Short fold brackets are
+    never excluded early.
+    """
+    from collections import defaultdict
+    import math
+
+    drawings = page.get_drawings()
+
+    def quant(p):
+        return (round(p[0] / point_tol), round(p[1] / point_tol))
+
+    def dist(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def sub(a, b):
+        return (a[0] - b[0], a[1] - b[1])
+
+    def nrm(v):
+        l = math.hypot(v[0], v[1])
+        if l < 1e-12:
+            return (0.0, 0.0)
+        return (v[0] / l, v[1] / l)
+
+    def dot(u, v):
+        return u[0] * v[0] + u[1] * v[1]
+
+    def seg_dir_from_item(item):
+        """Approximate unit direction from a path item ('l' or 'c')."""
+        op = item[0]
+        try:
+            if op == "l":
+                p1, p2 = item[1], item[2]
+                return nrm(sub((p2.x, p2.y), (p1.x, p1.y)))
+            if op == "c":
+                p0, p3 = item[1], item[4]
+                return nrm(sub((p3.x, p3.y), (p0.x, p0.y)))
+        except Exception:
+            return (0.0, 0.0)
+        return (0.0, 0.0)
+
+    def angle_deg_undirected(u, v):
+        """Angle between directions in [0, 90]."""
+        a = abs(dot(u, v))
+        a = 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
+        return math.degrees(math.acos(a))
+
+    def arrow_has_angled_segment(segments, shaft_dir, min_deg=10.0, max_deg=80.0):
+        """True if at least one segment is angled relative to shaft_dir."""
+        if shaft_dir == (0.0, 0.0):
+            return True
+        for a, b in segments:
+            d = nrm(sub(b, a))
+            if d == (0.0, 0.0):
+                continue
+            ang = angle_deg_undirected(shaft_dir, d)
+            if min_deg <= ang <= max_deg:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # 1) Collect ALL straight "l" segments + arrow candidates
+    #    (no path is excluded from geometry)
+    # ------------------------------------------------------------------
+    segments = []
+    arrow_paths = []
+
+    for path_idx, path in enumerate(drawings):
+        width = float(path.get("width") or 0.0)
+        color = path.get("color")
+        items = path.get("items", [])
+
+        r = path.get("rect")
+        segs_all = path_to_segments(path)
+
+        # Record arrow candidates (geometry is still extracted below)
+        if r is not None and segs_all:
+            size = max(r.width, r.height)
+            nseg = len(segs_all)
+            thin = 0 < width < min_arrow_width
+            if size <= max_arrow_size and nseg <= max_arrow_segments and not thin:
+                arrow_paths.append({
+                    "path": path,
+                    "segments": segs_all,
+                    "center": ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2),
+                    "path_id": path_idx,
+                })
+
+        # Always collect straight segments
+        for item in items:
+            if item[0] != "l":
+                continue
+            p1, p2 = item[1], item[2]
+            a = (p1.x, p1.y)
+            b = (p2.x, p2.y)
+            length = dist(a, b)
+            if length < 1.0:
+                continue
+            d = nrm(sub(b, a))
+            segments.append({
+                "a": a,
+                "b": b,
+                "length": length,
+                "dir": d,
+                "width": round(width, 2),
+                "color": tuple(round(float(c), 3) for c in color[:3]) if color else None,
+                "path": path,
+                "path_id": path_idx,
+            })
+
+    if not segments:
+        return []
+
+    # ------------------------------------------------------------------
+    # 2) Merge collinear endpoint-linked segments into runs
+    # ------------------------------------------------------------------
+    parent = list(range(len(segments)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    cell = max(join_gap * 1.5, 4.0)
+    grid = defaultdict(list)
+
+    def cell_of(p):
+        return (int(p[0] // cell), int(p[1] // cell))
+
+    for i, s in enumerate(segments):
+        grid[cell_of(s["a"])].append((i, "a"))
+        grid[cell_of(s["b"])].append((i, "b"))
+
+    neigh = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+
+    for i, s in enumerate(segments):
+        for ep_name, ep in (("a", s["a"]), ("b", s["b"])):
+            cx, cy = cell_of(ep)
+            for dx, dy in neigh:
+                for j, other_ep_name in grid.get((cx + dx, cy + dy), []):
+                    if j <= i:
+                        continue
+                    t = segments[j]
+                    if s["width"] != t["width"] or s["color"] != t["color"]:
+                        continue
+                    q = t[other_ep_name]
+                    if dist(ep, q) > join_gap:
+                        continue
+                    if abs(dot(s["dir"], t["dir"])) < collinear_dot_min:
+                        continue
+                    union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(len(segments)):
+        groups[find(i)].append(i)
+
+    runs = []
+    for idxs in groups.values():
+        segs = [segments[i] for i in idxs]
+        length = sum(s["length"] for s in segs)
+        longest = max(segs, key=lambda s: s["length"])
+        direction = longest["dir"]
+
+        counts = defaultdict(int)
+        sample = {}
+        for s in segs:
+            for p in (s["a"], s["b"]):
+                qp = quant(p)
+                counts[qp] += 1
+                sample[qp] = p
+        terminals = [sample[q] for q, c in counts.items() if c == 1]
+
+        if len(terminals) < 2:
+            pts = [p for s in segs for p in (s["a"], s["b"])]
+            best_d = -1.0
+            t0 = t1 = pts[0]
+            for i in range(len(pts)):
+                for j in range(i + 1, len(pts)):
+                    d = dist(pts[i], pts[j])
+                    if d > best_d:
+                        best_d = d
+                        t0, t1 = pts[i], pts[j]
+            terminals = [t0, t1]
+        elif len(terminals) > 2:
+            best_d = -1.0
+            t0, t1 = terminals[0], terminals[1]
+            for i in range(len(terminals)):
+                for j in range(i + 1, len(terminals)):
+                    d = dist(terminals[i], terminals[j])
+                    if d > best_d:
+                        best_d = d
+                        t0, t1 = terminals[i], terminals[j]
+            terminals = [t0, t1]
+
+        draw_segs = [(s["a"], s["b"]) for s in segs]
+        path_ids = sorted({s["path_id"] for s in segs})
+
+        runs.append({
+            "seg_idxs": list(idxs),
+            "segments": draw_segs,
+            "max_l": max(s["length"] for s in segs),
+            "length": length,
+            "direction": direction,
+            "terminals": (terminals[0], terminals[1]),
+            "width": longest["width"],
+            "color": longest["color"],
+            "path_ids": path_ids,
+        })
+
+    long_runs = [r for r in runs if r["max_l"] >= min_shaft_length]
+    long_runs.sort(key=lambda r: r["max_l"], reverse=True)
+
+    short_runs = [
+        r for r in runs
+        if min_crossbar_length <= r["length"] <= max_crossbar_length
+    ]
+
+    def arrow_hits_point(ap, point, radius):
+        if dist(ap["center"], point) <= radius:
+            return True
+        for a, b in ap["segments"]:
+            if dist(a, point) <= radius or dist(b, point) <= radius:
+                return True
+        return False
+
+    def arrow_near(point, radius, shaft_dir=None):
+        for ap in arrow_paths:
+            if not arrow_hits_point(ap, point, radius):
+                continue
+            if shaft_dir is not None and not arrow_has_angled_segment(ap["segments"], shaft_dir):
+                continue
+            return True
+        return False
+
+    def arrows_for_render(point, radius, shaft_dir=None):
+        out = []
+        for ap in arrow_paths:
+            if not arrow_hits_point(ap, point, radius):
+                continue
+            if shaft_dir is not None and not arrow_has_angled_segment(ap["segments"], shaft_dir):
+                continue
+            out.append(ap)
+        return out
+
+    # ------------------------------------------------------------------
+    # 3) Classify each long run (longest first; consume fold crossbars)
+    # ------------------------------------------------------------------
+    results = []
+    used_seg_idxs = set()
+
+    for L in long_runs:
+        if set(L["seg_idxs"]) & used_seg_idxs:
+            continue
+
+        ep1, ep2 = L["terminals"]
+        ldir = L["direction"]
+
+        # Grain ends: arrow near the shaft terminal itself
+        grain_ends = []
+        grain_arrows = []
+        for ep in (ep1, ep2):
+            if arrow_near(ep, arrow_search_radius, shaft_dir=ldir):
+                grain_ends.append(ep)
+                grain_arrows.extend(arrows_for_render(ep, arrow_search_radius, shaft_dir=ldir))
+
+        # Fold ends: external short perpendicular runs
+        fold_ends = 0
+        fold_bars = []
+        fold_arrows = []
+
+        for ep in (ep1, ep2):
+            best = None  # (inner_dist, short_run, outer, arrows)
+            for S in short_runs:
+                if set(S["seg_idxs"]) & set(L["seg_idxs"]):
+                    continue
+                if set(S["seg_idxs"]) & used_seg_idxs:
+                    continue
+                # real fold brackets match shaft stroke; arrow edges do not
+                if S["width"] != L["width"]:
+                    continue
+                if abs(dot(ldir, S["direction"])) > perp_dot_max:
+                    continue
+
+                s0, s1 = S["terminals"]
+                d0 = dist(s0, ep)
+                d1 = dist(s1, ep)
+                if min(d0, d1) > join_gap:
+                    continue
+
+                if d0 <= d1:
+                    inner, outer, inner_d = s0, s1, d0
+                else:
+                    inner, outer, inner_d = s1, s0, d1
+
+                if not arrow_near(outer, arrow_search_radius, shaft_dir=ldir):
+                    continue
+
+                arr = arrows_for_render(outer, arrow_search_radius, shaft_dir=ldir)
+                if best is None or inner_d < best[0]:
+                    best = (inner_d, S, outer, arr)
+
+            if best is not None:
+                fold_ends += 1
+                fold_bars.append(best[1])
+                fold_arrows.extend(best[3])
+
+        is_fold = fold_ends >= min_fold_ends
+        is_grain = len(grain_ends) >= 1
+
+        # Single-path U: short perp arms live inside the same long run
+        if not is_fold and is_grain:
+            own_short_perp = 0
+            own_arrows = []
+            for ep in (ep1, ep2):
+                for si in L["seg_idxs"]:
+                    s = segments[si]
+                    if s["length"] < min_crossbar_length or s["length"] > max_crossbar_length:
+                        continue
+                    if s["width"] != L["width"]:
+                        continue
+                    if abs(dot(ldir, s["dir"])) > perp_dot_max:
+                        continue
+                    d0 = dist(s["a"], ep)
+                    d1 = dist(s["b"], ep)
+                    if min(d0, d1) > join_gap:
+                        continue
+                    outer = s["b"] if d0 <= d1 else s["a"]
+                    if dist(outer, ep) < min_crossbar_length * 0.5:
+                        continue
+                    if arrow_near(outer, arrow_search_radius, shaft_dir=ldir):
+                        own_short_perp += 1
+                        own_arrows.extend(
+                            arrows_for_render(outer, arrow_search_radius, shaft_dir=ldir)
+                        )
+            if own_short_perp >= min_fold_ends:
+                is_fold = True
+                fold_arrows = own_arrows
+
+        if not is_fold and not is_grain:
+            continue
+
+        # Prefer fold when both could match (brackets + arrows near shaft ends)
+        if is_fold:
+            line_type = "fold"
+            arrows = fold_arrows
+            score = 100 + fold_ends * 10 + len(arrows)
+            used_seg_idxs.update(L["seg_idxs"])
+            for b in fold_bars:
+                used_seg_idxs.update(b["seg_idxs"])
+        else:
+            line_type = "grain"
+            arrows = grain_arrows
+            score = len(grain_ends) * 10 + len(arrows)
+            used_seg_idxs.update(L["seg_idxs"])
+
+        # Consume only the geometry that belongs to the arrows we just used.
+        # This prevents arrow edges from becoming false short shafts later,
+        # while leaving nearby fold brackets / other shafts completely free.
+        used_arrow_path_ids = {ap["path_id"] for ap in arrows}
+        for i, s in enumerate(segments):
+            if i in used_seg_idxs:
+                continue
+            if s["path_id"] in used_arrow_path_ids:
+                used_seg_idxs.add(i)
+
+        # de-dup arrows
+        uniq = {}
+        for a in arrows:
+            uniq[id(a["path"])] = a
+        arrows = list(uniq.values())
+
+        extra = []
+        if is_fold:
+            for b in fold_bars:
+                extra.extend(b["segments"])
+        for a in arrows:
+            extra.extend(a["segments"])
+
+        results.append({
+            "type": line_type,
+            "shaft": {
+                "path": None,
+                "segments": L["segments"],
+                "length": L["length"],
+                "endpoints": L["terminals"],
+                "rect": None,
+                "num_segments": len(L["segments"]),
+                "path_ids": L["path_ids"],
+            },
+            "arrows": arrows,
+            "crossbars": fold_bars if is_fold else [],
+            "score": score,
+            "segments": L["segments"],
+            "all_segments": L["segments"] + extra,
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+# ------------------------------------------------------------------
+# Write text output
+# ------------------------------------------------------------------
+def write_patterns_txt(pieces, out_path: Path):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"# Pattern pieces: {len(pieces)}\n")
+        f.write("# Main outline only (user selects sections interactively)\n\n")
+
+        for i, p in enumerate(pieces):
+            f.write(f"PIECE {i}\n")
+            f.write(f"  area      : {p.get('area', 0.0):.1f}\n")
+            f.write(f"  perimeter : {p.get('perimeter', 0.0):.1f}\n")
+            f.write(f"  bbox      : {p.get('bbox')}\n")
+            f.write(f"  closed    : {p.get('closed', True)}\n")
+            f.write(f"  path_ids  : {p.get('path_ids', [])}\n")
+            f.write(f"  segments  : {len(p.get('segments', []))}\n")
+            for s in p.get("segments", []):
+                f.write(f"    {s[0]} -> {s[1]}\n")
+
+            # ordered points (useful for interactive selection later)
+            pts = p.get("points") or []
+            if pts:
+                f.write(f"  points    : {len(pts)}\n")
+                for pt in pts:
+                    f.write(f"    {pt}\n")
+
+            f.write("\n")
+
+    print(f"Wrote patterns → {out_path}")
+
+
+def write_lines_txt(lines, out_path: Path):
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"# Special lines: {len(lines)}\n\n")
+        for i, obj in enumerate(lines):
+            f.write(f"LINE {i}  type={obj['type']}\n")
+            f.write(f"  score        : {obj['score']}\n")
+            f.write(f"  shaft_length : {obj['shaft']['length']:.1f}\n")
+            f.write(f"  shaft_segs   : {obj['shaft']['num_segments']}\n")
+            f.write(f"  endpoints    : {obj['shaft']['endpoints']}\n")
+            f.write(f"  arrows       : {len(obj['arrows'])}\n")
+            f.write("  shaft segments:\n")
+            for s in obj["shaft"]["segments"]:
+                f.write(f"    {s[0]} -> {s[1]}\n")
+            f.write("  arrow segments:\n")
+            for a in obj["arrows"]:
+                for s in a["segments"]:
+                    f.write(f"    {s[0]} -> {s[1]}\n")
+            f.write("\n")
+    print(f"Wrote lines → {out_path}")
+
+
+# ------------------------------------------------------------------
+# Rendering
+# ------------------------------------------------------------------
+def render(page, objects, mode, out_path: Path, assembled=None):
+    """
+    Render detection results.
+    
+    - assembled=None  → classic single-page render (with PDF background)
+    - assembled=dict  → single large assembled canvas (no background image)
+    """
+    if assembled is not None:
+        # ---------- multi-page assembled view ----------
+        global_rect = assembled["global_rect"]
+        fig_w = 16
+        fig_h = max(8.0, fig_w * global_rect.height / max(global_rect.width, 1.0))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        ax.set_xlim(global_rect.x0 - 10, global_rect.x1 + 10)
+        ax.set_ylim(global_rect.y1 + 10, global_rect.y0 - 10)  # PDF y-down
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(
+            f"{mode.upper()} – assembled view  "
+            f"({assembled['grid'][0]}×{assembled['grid'][1]} tiles)"
+        )
+
+        # Light tile grid
+        tile_w = assembled["tile_w"]
+        tile_h = assembled["tile_h"]
+        cols, rows = assembled["grid"]
+        for r in range(rows + 1):
+            y = r * tile_h
+            ax.axhline(y, color="0.85", linewidth=0.6, zorder=0)
+        for c in range(cols + 1):
+            x = c * tile_w
+            ax.axvline(x, color="0.85", linewidth=0.6, zorder=0)
+
+    else:
+        # ---------- classic single-page render ----------
+        page_rect = page.rect
+        fig, ax = plt.subplots(figsize=(12, 12 * page_rect.height / page_rect.width))
+        ax.set_xlim(page_rect.x0, page_rect.x1)
+        ax.set_ylim(page_rect.y1, page_rect.y0)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(f"{mode.upper()} detection")
+
+        # PDF background
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        ax.imshow(
+            img,
+            extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
+            alpha=0.40,
+            zorder=0,
+        )
+
+    colors = plt.cm.tab10.colors
+
+    if mode == "patterns":
+        for i, piece in enumerate(objects):
+            main_color = colors[i % len(colors)]
+
+            # Main outline
+            if piece.get("segments"):
+                lc = LineCollection(
+                    piece["segments"],
+                    colors=[main_color],
+                    linewidths=2.0,
+                    alpha=0.95,
+                    zorder=3,
+                )
+                ax.add_collection(lc)
+
+            # Bounding box + index
+            x0, y0, x1, y1 = piece["bbox"]
+            rect = Rectangle(
+                (x0, y0),
+                x1 - x0,
+                y1 - y0,
+                fill=False,
+                edgecolor=main_color,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.7,
+                zorder=1,
+            )
+            ax.add_patch(rect)
+            ax.text(
+                x0 + 4,
+                y1 - 4,
+                f"{i}",
+                color=main_color,
+                fontsize=11,
+                fontweight="bold",
+                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1),
+                zorder=6,
+            )
+
+        # Legend (simplified)
+        ax.text(
+            0.02, 0.02,
+            "Solid coloured = main outline",
+            transform=ax.transAxes,
+            fontsize=8,
+            verticalalignment="bottom",
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
+            zorder=7,
+        )
+
+    else:  # lines mode
+        for i, obj in enumerate(objects):
+            color = "red" if obj["type"] == "grain" else "purple"
+            lc = LineCollection(
+                obj["all_segments"],
+                colors=color,
+                linewidths=2.2,
+                alpha=0.9,
+                zorder=3,
+            )
+            ax.add_collection(lc)
+            for ep in obj["shaft"]["endpoints"]:
+                ax.plot(ep[0], ep[1], "o", color="orange", markersize=6, zorder=4)
+            ax.text(
+                obj["shaft"]["endpoints"][0][0],
+                obj["shaft"]["endpoints"][0][1],
+                f"{i}:{obj['type'][0].upper()}",
+                color=color,
+                fontsize=9,
+                fontweight="bold",
+                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"),
+                zorder=5,
+            )
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved PNG → {out_path}")
+
+
+
+def parse_page_spec(spec, doc):
+    """None → all pages. '0-2,5' → those indices."""
+    if spec is None:
+        return list(range(len(doc)))
+    pages = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = map(int, part.split("-"))
+            pages.extend(range(a, b + 1))
+        else:
+            pages.append(int(part))
+    return sorted(set(p for p in pages if 0 <= p < len(doc)))
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Step 1: read PDF paths as-is")
-    parser.add_argument("--pdf", type=Path, required=True)
-    parser.add_argument("--pages", type=str, default="0", help="e.g. 0 or 0-2 or 0,2")
+    parser = argparse.ArgumentParser(
+        description="Assemble multi-page pattern, then debug steps 1–5 + UI"
+    )
+    parser.add_argument("--pattern-pdf", type=Path, required=True)
+    parser.add_argument("--lines-pdf", type=Path, required=True)
+    parser.add_argument("--pattern-pages", type=str, default=None)
+    parser.add_argument("--lines-pages", type=str, default=None)
+    parser.add_argument("--overlap", type=float, default=0.0)
     parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument("--min-seg-length", type=float, default=0.5)
+    parser.add_argument("--min-seg-length", type=float, default=2.0)
+    parser.add_argument("--max-extension", type=float, default=15.0)
+    parser.add_argument("--join-radius", type=float, default=10.0)
+    parser.add_argument("--path-snap-radius", type=float, default=2.0)
+    parser.add_argument("--snap-tol", type=float, default=0.1)
+    parser.add_argument("--min-face-area", type=float, default=400.0)
     args = parser.parse_args()
 
-    if not args.pdf.is_file():
-        raise SystemExit(f"PDF not found: {args.pdf}")
+    if not args.pattern_pdf.is_file():
+        raise SystemExit(f"Pattern PDF not found: {args.pattern_pdf}")
+    if not args.lines_pdf.is_file():
+        raise SystemExit(f"Lines PDF not found: {args.lines_pdf}")
 
-    out_dir = args.out_dir or (args.pdf.parent / "debug_outline")
+    pattern_doc = fitz.open(args.pattern_pdf)
+    instr_doc = fitz.open(args.lines_pdf)
+
+    pat_pages = parse_page_spec(args.pattern_pages, pattern_doc)
+    line_pages = parse_page_spec(args.lines_pages, instr_doc)
+    if not pat_pages:
+        raise SystemExit("No valid pattern pages")
+    if not line_pages:
+        raise SystemExit("No valid lines pages")
+
+    out_dir = args.out_dir or (args.pattern_pdf.parent / "debug_outline")
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.pdf.stem
+    stem = f"{args.pattern_pdf.stem}_assembled"
 
-    doc = fitz.open(args.pdf)
+    print(f"Pattern PDF   : {args.pattern_pdf}")
+    print(f"Lines PDF     : {args.lines_pdf}")
+    print(f"Pattern pages : {pat_pages}")
+    print(f"Lines pages   : {line_pages}")
+    print(f"Out dir       : {out_dir}")
 
-    def parse_pages(spec, doc):
-        pages = []
-        for part in spec.split(","):
-            part = part.strip()
-            if "-" in part:
-                a, b = map(int, part.split("-"))
-                pages.extend(range(a, b + 1))
-            else:
-                pages.append(int(part))
-        return sorted(set(p for p in pages if 0 <= p < len(doc)))
+    # ----- assemble both PDFs into one canvas -----
+    print("\n=== Assembling pattern pages ===")
+    assembled_pat = assemble_pages(
+        pattern_doc, pat_pages,
+        instr_doc, line_pages,
+        overlap=args.overlap,
+    )
+    page = AssembledPage(assembled_pat["paths"], assembled_pat["global_rect"])
 
-    page_nums = parse_pages(args.pages, doc)
-    if not page_nums:
-        raise SystemExit("No valid pages selected")
+    print("\n=== Assembling lines / instructions pages ===")
+    assembled_lines = assemble_pages(
+        instr_doc, line_pages,
+        instr_doc, line_pages,
+        overlap=args.overlap,
+    )
+    page_lines = AssembledPage(
+        assembled_lines["paths"], assembled_lines["global_rect"]
+    )
 
-    print(f"PDF     : {args.pdf}")
-    print(f"Pages   : {page_nums}")
-    print(f"Out dir : {out_dir}")
-
-    for pno in page_nums:
-        page = doc[pno]
-        page_stem = f"{stem}_p{pno}"
-        print(f"\n=== Page {pno} ===")
-        # ----- STEP 1 - Read and draw as is -----        
-        records, all_segments = step1_read_and_draw(
-            page,
-            out_dir=out_dir,
-            stem=page_stem,
-            min_segment_length=2.0,
+    # ----- special lines (grain, etc.) -----
+    print("\n=== Detecting special lines ===")
+    lines = detect_special_lines(page_lines)
+    print(f"Found {len(lines)} special line(s)")
+    for i, obj in enumerate(lines):
+        print(
+            f"  [{i}] {obj.get('type', '?'):5s}  score={obj.get('score')}  "
+            f"segs={obj.get('shaft', {}).get('num_segments', '?')}"
         )
-        print(f"  paths={len(records)}  segments={len(all_segments)}")
+    write_lines_txt(lines, out_dir / f"{stem}_lines.txt")
+    render(
+        page_lines,
+        lines,
+        "lines",
+        out_dir / f"{stem}_lines.png",
+        assembled=assembled_lines,
+    )
 
-        # ----- STEP 2 - Extend to first hit -----
-        ext_records, ext_segments, applied, hit_points = step2_extend_to_first_hit(
-            records,
-            out_dir=out_dir,
-            stem=page_stem,
-            max_extension=15.0,
-        )
-        print(f"  step2  extended_ends={len(applied)}  hit_points={len(hit_points)}")
+    # ----- STEP 1 -----
+    print("\n=== STEP 1 – read paths ===")
+    records, all_segments = step1_read_and_draw(
+        page,
+        out_dir=out_dir,
+        stem=stem,
+        min_segment_length=args.min_seg_length,
+    )
+    print(f"  paths={len(records)}  segments={len(all_segments)}")
 
-        # ----- STEP 3 - junction snapping -----
-        junc_records, junc_segments = step3_snap_open_to_hits(
-            ext_records,
-            applied,
-            hit_points,
-            out_dir=out_dir,
-            stem=page_stem,
-            join_radius=10.0,
-            path_snap_radius=2.0,
-        )
-        print(f"  step3 segments={len(junc_segments)}")
+    # ----- STEP 2 -----
+    print("\n=== STEP 2 – extend ===")
+    ext_records, ext_segments, applied, hit_points = step2_extend_to_first_hit(
+        records,
+        out_dir=out_dir,
+        stem=stem,
+        max_extension=args.max_extension,
+    )
+    print(f"  extended_ends={len(applied)}  hit_points={len(hit_points)}")
 
-        # ----- STEP 4 - Snap + unary union -----
-        noded, noded_segments = step4_snap_and_union(
-            junc_records,
-            out_dir=out_dir,
-            stem=page_stem,
-            snap_tol=0.1,   # float noise only; try 0.01–0.1
-        )
-        print(f"  step4 noded segments={len(noded_segments)}")        
+    # ----- STEP 3 -----
+    print("\n=== STEP 3 – junctions ===")
+    junc_records, junc_segments = step3_snap_open_to_hits(
+        ext_records,
+        applied,
+        hit_points,
+        out_dir=out_dir,
+        stem=stem,
+        join_radius=args.join_radius,
+        path_snap_radius=args.path_snap_radius,
+    )
+    print(f"  segments={len(junc_segments)}")
 
-        # ----- STEP 5 - Polygonize -----
-        faces = step5_polygonize(
-            noded, out_dir, page_stem, min_face_area=400.0,
-        )
-        print(f"  step5 faces={len(faces)}")
+    # ----- STEP 4 -----
+    print("\n=== STEP 4 – snap + union ===")
+    noded, noded_segments = step4_snap_and_union(
+        junc_records,
+        out_dir=out_dir,
+        stem=stem,
+        snap_tol=args.snap_tol,
+    )
+    print(f"  noded segments={len(noded_segments)}")
+
+    # ----- STEP 5 -----
+    print("\n=== STEP 5 – polygonize ===")
+    faces = step5_polygonize(
+        noded, out_dir, stem, min_face_area=args.min_face_area,
+    )
+    print(f"  faces={len(faces)}")
 
     faces_per_piece = group_faces_into_pieces(faces)
     print(f"  pieces={len(faces_per_piece)}")
@@ -1570,13 +2521,16 @@ def main():
 
     print("\n=== Interactive face selection ===")
     print("Click faces to toggle.  Enter/d=done  a=all  c=clear  Esc=cancel")
-    selected = select_faces_interactive(page, faces_per_piece)
+    selected = select_faces_interactive(
+        page, faces_per_piece, assembled=assembled_pat,
+    )
     print(f"Selected outlines: {len(selected)}")
     for i, p in enumerate(selected):
         print(f"  [{i}] area={p['area']:.0f}  peri={p['perimeter']:.0f}")
 
-    doc.close()
-    print("\nDone. Check the Step 1 PNG and summary txt.")
+    pattern_doc.close()
+    instr_doc.close()
+    print("\nDone.")
 
 
 if __name__ == "__main__":
