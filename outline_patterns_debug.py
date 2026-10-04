@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-outline_patterns_debug.py – Step 1 + 2 only
+outline_patterns_debug.py
 
 Read stroked paths from a PDF page and draw them exactly as they are
 (no snap, no union, no extension). Saves a PNG + a short text summary
