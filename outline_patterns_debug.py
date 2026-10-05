@@ -2,10 +2,6 @@
 """
 outline_patterns_debug.py
 
-Read stroked paths from a PDF page and draw them exactly as they are
-(no snap, no union, no extension). Saves a PNG + a short text summary
-so you can verify the raw geometry before any later processing.
-
 How to run:
 python outline_patterns_debug.py --pattern-pdf PAT.pdf --lines-pdf LINES.pdf --pattern-pages 0-3 --lines-pages 0-3
 """
@@ -313,13 +309,10 @@ def _unit_dir(a, b):
         return (0.0, 0.0)
     return (dx / L, dy / L)
 
-def path_to_segments(path):
+def path_to_segments(path, n_bezier=8):
     """
     Convert one PyMuPDF drawing path into straight segments.
-
-    Beziers are sampled so curves become polylines. Rectangles and
-    quads are expanded to their four edges. This is the only place
-    PDF operators are interpreted.
+    n_bezier: samples per cubic (8 = arrows stay small; 32 = smoother outlines).
     """
     segments = []
     for item in path.get("items", []):
@@ -337,7 +330,7 @@ def path_to_segments(path):
             ])
         elif op == "c":
             p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
-            ts = np.linspace(0, 1, 32)
+            ts = np.linspace(0, 1, n_bezier)
             pts = []
             for t in ts:
                 x = (
@@ -381,6 +374,55 @@ def segments_bbox(segments):
     ys = [p[1] for s in segments for p in s]
     return (min(xs), min(ys), max(xs), max(ys))
 
+def step_lines_detect(page, out_dir: Path, stem: str, assembled=None, **kwargs):
+    """
+    Detect grain/fold lines, then write debug TXT + PNG (same style as steps 1–5).
+    """
+    lines = detect_special_lines(page, **kwargs)
+    n_grain = sum(1 for o in lines if o["type"] == "grain")
+    n_fold = sum(1 for o in lines if o["type"] == "fold")
+
+    print(f"  grain={n_grain}  fold={n_fold}  total={len(lines)}")
+    for i, obj in enumerate(lines):
+        print(
+            f"  [{i}] {obj['type']:5s}  score={obj['score']}  "
+            f"shaft={obj['shaft']['length']:.1f}  "
+            f"segs={obj['shaft']['num_segments']}  "
+            f"arrows={len(obj['arrows'])}"
+        )
+
+    summary_path = out_dir / f"{stem}_lines_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("LINES – grain / fold\n")
+        f.write(f"  grain : {n_grain}\n")
+        f.write(f"  fold  : {n_fold}\n")
+        f.write(f"  total : {len(lines)}\n")
+        for i, obj in enumerate(lines):
+            sh = obj["shaft"]
+            f.write(
+                f"  [{i}] type={obj['type']}  score={obj['score']}  "
+                f"shaft_len={sh['length']:.1f}  segs={sh['num_segments']}  "
+                f"arrows={len(obj['arrows'])}  path_ids={sh.get('path_ids', [])}\n"
+            )
+            f.write(f"      endpoints : {sh['endpoints']}\n")
+            f.write(f"      shaft segments ({len(sh['segments'])}):\n")
+            for s in sh["segments"]:
+                f.write(f"        {s[0]} -> {s[1]}\n")
+            n_arrow_seg = sum(len(a["segments"]) for a in obj["arrows"])
+            f.write(f"      arrow segments ({n_arrow_seg}):\n")
+            for a in obj["arrows"]:
+                for s in a["segments"]:
+                    f.write(f"        {s[0]} -> {s[1]}\n")
+            if obj.get("crossbars"):
+                f.write(f"      crossbars : {len(obj['crossbars'])}\n")
+    print(f"LINES summary → {summary_path}")
+
+    png_path = out_dir / f"{stem}_lines.png"
+    _draw_lines_debug(page, lines, png_path, assembled=assembled)
+    print(f"LINES image   → {png_path}")
+    return lines
+
+
 def step1_read_and_draw(page, out_dir: Path, stem: str, min_segment_length: float = 0.5):
     """
     Step 1: extract every stroked path, convert to segments, save debug
@@ -401,7 +443,7 @@ def step1_read_and_draw(page, out_dir: Path, stem: str, min_segment_length: floa
         if color is None and width <= 0:
             continue
 
-        segs = path_to_segments(path)
+        segs = path_to_segments(path, n_bezier=32)
         if not segs:
             continue
 
@@ -1218,6 +1260,26 @@ def step5_polygonize(noded, out_dir: Path, stem: str, min_face_area: float = 400
     return faces
 
 
+def step_write_selected(selected, out_dir: Path, stem: str):
+    summary_path = out_dir / f"{stem}_selected_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("SELECTED – combined outlines\n")
+        f.write(f"  pieces : {len(selected)}\n")
+        for i, p in enumerate(selected):
+            f.write(
+                f"  [{i}] area={p.get('area', 0):.0f}  peri={p.get('perimeter', 0):.1f}  "
+                f"pts={len(p.get('points') or [])}  bbox={p.get('bbox')}\n"
+            )
+            f.write(f"      segments ({len(p.get('segments') or [])}):\n")
+            for s in p.get("segments") or []:
+                f.write(f"        {s[0]} -> {s[1]}\n")
+    print(f"SELECTED summary → {summary_path}")
+
+    png_path = out_dir / f"{stem}_selected.png"
+    _draw_selected_debug(selected, png_path)
+    print(f"SELECTED image   → {png_path}")
+
+
 def group_faces_into_pieces(faces, min_shared_edge: float = 1.0):
     """
     Faces that share a real edge belong to the same pattern piece.
@@ -1259,6 +1321,73 @@ def group_faces_into_pieces(faces, min_shared_edge: float = 1.0):
         faces_per_piece.append((pi, [faces[k] for k in idxs]))
     return faces_per_piece
 
+def _draw_lines_debug(page, lines, out_path: Path, assembled=None):
+    """Same canvas style as _draw_step2_debug / _draw_faces_debug."""
+    if assembled is not None:
+        r = assembled["global_rect"]
+        x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
+        grid = assembled.get("grid")
+        tile_w = assembled.get("tile_w")
+        tile_h = assembled.get("tile_h")
+    else:
+        r = page.rect
+        x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
+        grid = tile_w = tile_h = None
+
+    w, h = max(x1 - x0, 1.0), max(y1 - y0, 1.0)
+    fig, ax = plt.subplots(figsize=(14, max(6.0, 14 * h / w)))
+    ax.set_xlim(x0 - 20, x1 + 20)
+    ax.set_ylim(y1 + 20, y0 - 20)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title("LINES – grain (red) / fold (purple)", fontsize=11)
+
+    if grid is not None and tile_w and tile_h:
+        cols, rows = grid
+        for rr in range(rows + 1):
+            ax.axhline(rr * tile_h, color="0.90", linewidth=0.5, zorder=0)
+        for cc in range(cols + 1):
+            ax.axvline(cc * tile_w, color="0.90", linewidth=0.5, zorder=0)
+
+    # faint context: every drawing on the page
+    ctx = []
+    for path in page.get_drawings():
+        ctx.extend(path_to_segments(path))
+    if ctx:
+        ax.add_collection(LineCollection(
+            ctx, colors=["0.82"], linewidths=0.5, alpha=0.8, zorder=1
+        ))
+
+    for i, obj in enumerate(lines):
+        color = "red" if obj["type"] == "grain" else "purple"
+        segs = obj.get("all_segments") or obj["shaft"]["segments"]
+        if segs:
+            ax.add_collection(LineCollection(
+                segs, colors=[color], linewidths=2.0, alpha=0.95, zorder=3
+            ))
+        for ep in obj["shaft"]["endpoints"]:
+            ax.plot(ep[0], ep[1], "o", color="orange", markersize=5, zorder=4)
+        ax.text(
+            obj["shaft"]["endpoints"][0][0],
+            obj["shaft"]["endpoints"][0][1],
+            f"{i}:{obj['type'][0].upper()}",
+            color=color, fontsize=8, fontweight="bold",
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", pad=1),
+            zorder=5,
+        )
+
+    n_grain = sum(1 for o in lines if o["type"] == "grain")
+    n_fold = sum(1 for o in lines if o["type"] == "fold")
+    ax.text(
+        0.01, 0.99,
+        f"grain={n_grain}  fold={n_fold}",
+        transform=ax.transAxes, fontsize=9, va="top",
+        bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
+        zorder=10,
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close()
 
 def _draw_faces_debug(faces, out_path: Path):
     if not faces:
@@ -1439,6 +1568,37 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
 
+
+def _draw_selected_debug(selected, out_path: Path):
+    if not selected:
+        return
+    xs0, ys0, xs1, ys1 = zip(*[p["bbox"] for p in selected])
+    x0, y0, x1, y1 = min(xs0), min(ys0), max(xs1), max(ys1)
+    w, h = max(x1 - x0, 1.0), max(y1 - y0, 1.0)
+    fig, ax = plt.subplots(figsize=(14, max(6.0, 14 * h / w)))
+    ax.set_xlim(x0 - 20, x1 + 20)
+    ax.set_ylim(y1 + 20, y0 - 20)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title("SELECTED – combined outlines", fontsize=11)
+    try:
+        cmap = mpl.colormaps["tab10"]
+    except (AttributeError, KeyError):
+        cmap = plt.cm.get_cmap("tab10")
+    for i, p in enumerate(selected):
+        segs = p.get("segments") or []
+        if segs:
+            ax.add_collection(LineCollection(
+                segs, colors=[cmap(i % 10)], linewidths=2.0, zorder=3
+            ))
+    ax.text(
+        0.01, 0.99, f"pieces={len(selected)}",
+        transform=ax.transAxes, fontsize=9, va="top",
+        bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close()    
 
 # ------------------------------------------------------------------
 # INTERACTIVE FACE SELECTOR  (v2 – faster, per-piece colours, start selected)
@@ -2177,198 +2337,6 @@ def detect_special_lines(page,
     return results
 
 
-# ------------------------------------------------------------------
-# Write text output
-# ------------------------------------------------------------------
-def write_patterns_txt(pieces, out_path: Path):
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"# Pattern pieces: {len(pieces)}\n")
-        f.write("# Main outline only (user selects sections interactively)\n\n")
-
-        for i, p in enumerate(pieces):
-            f.write(f"PIECE {i}\n")
-            f.write(f"  area      : {p.get('area', 0.0):.1f}\n")
-            f.write(f"  perimeter : {p.get('perimeter', 0.0):.1f}\n")
-            f.write(f"  bbox      : {p.get('bbox')}\n")
-            f.write(f"  closed    : {p.get('closed', True)}\n")
-            f.write(f"  path_ids  : {p.get('path_ids', [])}\n")
-            f.write(f"  segments  : {len(p.get('segments', []))}\n")
-            for s in p.get("segments", []):
-                f.write(f"    {s[0]} -> {s[1]}\n")
-
-            # ordered points (useful for interactive selection later)
-            pts = p.get("points") or []
-            if pts:
-                f.write(f"  points    : {len(pts)}\n")
-                for pt in pts:
-                    f.write(f"    {pt}\n")
-
-            f.write("\n")
-
-    print(f"Wrote patterns → {out_path}")
-
-
-def write_lines_txt(lines, out_path: Path):
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"# Special lines: {len(lines)}\n\n")
-        for i, obj in enumerate(lines):
-            f.write(f"LINE {i}  type={obj['type']}\n")
-            f.write(f"  score        : {obj['score']}\n")
-            f.write(f"  shaft_length : {obj['shaft']['length']:.1f}\n")
-            f.write(f"  shaft_segs   : {obj['shaft']['num_segments']}\n")
-            f.write(f"  endpoints    : {obj['shaft']['endpoints']}\n")
-            f.write(f"  arrows       : {len(obj['arrows'])}\n")
-            f.write("  shaft segments:\n")
-            for s in obj["shaft"]["segments"]:
-                f.write(f"    {s[0]} -> {s[1]}\n")
-            f.write("  arrow segments:\n")
-            for a in obj["arrows"]:
-                for s in a["segments"]:
-                    f.write(f"    {s[0]} -> {s[1]}\n")
-            f.write("\n")
-    print(f"Wrote lines → {out_path}")
-
-
-# ------------------------------------------------------------------
-# Rendering
-# ------------------------------------------------------------------
-def render(page, objects, mode, out_path: Path, assembled=None):
-    """
-    Render detection results.
-    
-    - assembled=None  → classic single-page render (with PDF background)
-    - assembled=dict  → single large assembled canvas (no background image)
-    """
-    if assembled is not None:
-        # ---------- multi-page assembled view ----------
-        global_rect = assembled["global_rect"]
-        fig_w = 16
-        fig_h = max(8.0, fig_w * global_rect.height / max(global_rect.width, 1.0))
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        ax.set_xlim(global_rect.x0 - 10, global_rect.x1 + 10)
-        ax.set_ylim(global_rect.y1 + 10, global_rect.y0 - 10)  # PDF y-down
-        ax.set_aspect("equal")
-        ax.axis("off")
-        ax.set_title(
-            f"{mode.upper()} – assembled view  "
-            f"({assembled['grid'][0]}×{assembled['grid'][1]} tiles)"
-        )
-
-        # Light tile grid
-        tile_w = assembled["tile_w"]
-        tile_h = assembled["tile_h"]
-        cols, rows = assembled["grid"]
-        for r in range(rows + 1):
-            y = r * tile_h
-            ax.axhline(y, color="0.85", linewidth=0.6, zorder=0)
-        for c in range(cols + 1):
-            x = c * tile_w
-            ax.axvline(x, color="0.85", linewidth=0.6, zorder=0)
-
-    else:
-        # ---------- classic single-page render ----------
-        page_rect = page.rect
-        fig, ax = plt.subplots(figsize=(12, 12 * page_rect.height / page_rect.width))
-        ax.set_xlim(page_rect.x0, page_rect.x1)
-        ax.set_ylim(page_rect.y1, page_rect.y0)
-        ax.set_aspect("equal")
-        ax.axis("off")
-        ax.set_title(f"{mode.upper()} detection")
-
-        # PDF background
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        ax.imshow(
-            img,
-            extent=[page_rect.x0, page_rect.x1, page_rect.y1, page_rect.y0],
-            alpha=0.40,
-            zorder=0,
-        )
-
-    colors = plt.cm.tab10.colors
-
-    if mode == "patterns":
-        for i, piece in enumerate(objects):
-            main_color = colors[i % len(colors)]
-
-            # Main outline
-            if piece.get("segments"):
-                lc = LineCollection(
-                    piece["segments"],
-                    colors=[main_color],
-                    linewidths=2.0,
-                    alpha=0.95,
-                    zorder=3,
-                )
-                ax.add_collection(lc)
-
-            # Bounding box + index
-            x0, y0, x1, y1 = piece["bbox"]
-            rect = Rectangle(
-                (x0, y0),
-                x1 - x0,
-                y1 - y0,
-                fill=False,
-                edgecolor=main_color,
-                linestyle="--",
-                linewidth=1.0,
-                alpha=0.7,
-                zorder=1,
-            )
-            ax.add_patch(rect)
-            ax.text(
-                x0 + 4,
-                y1 - 4,
-                f"{i}",
-                color=main_color,
-                fontsize=11,
-                fontweight="bold",
-                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=1),
-                zorder=6,
-            )
-
-        # Legend (simplified)
-        ax.text(
-            0.02, 0.02,
-            "Solid coloured = main outline",
-            transform=ax.transAxes,
-            fontsize=8,
-            verticalalignment="bottom",
-            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
-            zorder=7,
-        )
-
-    else:  # lines mode
-        for i, obj in enumerate(objects):
-            color = "red" if obj["type"] == "grain" else "purple"
-            lc = LineCollection(
-                obj["all_segments"],
-                colors=color,
-                linewidths=2.2,
-                alpha=0.9,
-                zorder=3,
-            )
-            ax.add_collection(lc)
-            for ep in obj["shaft"]["endpoints"]:
-                ax.plot(ep[0], ep[1], "o", color="orange", markersize=6, zorder=4)
-            ax.text(
-                obj["shaft"]["endpoints"][0][0],
-                obj["shaft"]["endpoints"][0][1],
-                f"{i}:{obj['type'][0].upper()}",
-                color=color,
-                fontsize=9,
-                fontweight="bold",
-                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"),
-                zorder=5,
-            )
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved PNG → {out_path}")
-
-
-
 def parse_page_spec(spec, doc):
     """None → all pages. '0-2,5' → those indices."""
     if spec is None:
@@ -2446,22 +2414,9 @@ def main():
         assembled_lines["paths"], assembled_lines["global_rect"]
     )
 
-    # ----- special lines (grain, etc.) -----
-    print("\n=== Detecting special lines ===")
-    lines = detect_special_lines(page_lines)
-    print(f"Found {len(lines)} special line(s)")
-    for i, obj in enumerate(lines):
-        print(
-            f"  [{i}] {obj.get('type', '?'):5s}  score={obj.get('score')}  "
-            f"segs={obj.get('shaft', {}).get('num_segments', '?')}"
-        )
-    write_lines_txt(lines, out_dir / f"{stem}_lines.txt")
-    render(
-        page_lines,
-        lines,
-        "lines",
-        out_dir / f"{stem}_lines.png",
-        assembled=assembled_lines,
+    print("\n=== LINES – grain / fold ===")
+    lines = step_lines_detect(
+        page_lines, out_dir, stem, assembled=assembled_lines,
     )
 
     # ----- STEP 1 -----
@@ -2528,6 +2483,8 @@ def main():
     for i, p in enumerate(selected):
         print(f"  [{i}] area={p['area']:.0f}  peri={p['perimeter']:.0f}")
 
+    step_write_selected(selected, out_dir, stem)
+    
     pattern_doc.close()
     instr_doc.close()
     print("\nDone.")
@@ -2538,5 +2495,3 @@ if __name__ == "__main__":
 
 
 # TODO
-# Handle converging paths.
-    # Snap together points at junction if more then 3 path endpoints are within a 5 point radius? 10-HAUTS example, top left pattern bottom left corner. 
