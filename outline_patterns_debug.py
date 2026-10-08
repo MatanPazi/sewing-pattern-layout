@@ -1941,12 +1941,6 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
     )
     from shapely.ops import unary_union
 
-    PALETTE = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-        "#393b79", "#637939", "#8c6d31", "#843c39", "#7b4173",
-        "#3182bd", "#e6550d", "#31a354", "#756bb1", "#636363",
-    ]
     lines = lines or []
     pieces = {pi: fl for pi, fl in faces_per_piece}
 
@@ -2111,7 +2105,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
             self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
         def color_for(self, pi, alpha):
-            c = QColor(PALETTE[pi % len(PALETTE)])
+            c = QColor("#475461")
             c.setAlpha(alpha)
             return c
 
