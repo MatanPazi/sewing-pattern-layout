@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
 """
+#!/usr/bin/env python3
 outline_patterns_debug.py
 
 How to run:
@@ -23,6 +23,7 @@ from matplotlib.patches import Polygon as MplPolygon
 from shapely.geometry import Point
 from shapely.ops import polygonize, unary_union
 
+import json
 
 # ------------------------------------------------------------------
 # Multi-page assembly helpers
@@ -1275,6 +1276,22 @@ def step_write_selected(selected, out_dir: Path, stem: str):
                 f.write(f"        {s[0]} -> {s[1]}\n")
     print(f"SELECTED summary → {summary_path}")
 
+    json_path = out_dir / f"{stem}_selected.json"
+    payload = []
+    for i, p in enumerate(selected):
+        payload.append({
+            "index": i,
+            "source_piece": p.get("source_piece"),
+            "area": p.get("area"),
+            "perimeter": p.get("perimeter"),
+            "bbox": [float(x) for x in (p.get("bbox") or ())],
+            "selected_faces": p.get("selected_faces") or [],
+            "points": [[float(x), float(y)] for x, y in (p.get("points") or [])],
+        })
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"pieces": payload}, f, indent=2)
+    print(f"SELECTED json    → {json_path}")
+
     png_path = out_dir / f"{stem}_selected.png"
     _draw_selected_debug(selected, png_path)
     print(f"SELECTED image   → {png_path}")
@@ -1906,6 +1923,386 @@ class FaceSelector:
         return result
 
 
+def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
+    """
+    Desktop picker. Hover highlights a whole piece. First click selects it.
+    Later clicks toggle inner faces. Alt-click drops the piece.
+    Returns combined outlines, same shape as FaceSelector.run().
+    """
+    import sys
+    from PySide6.QtCore import Qt, QPointF, QTimer
+    from PySide6.QtGui import (
+        QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF,
+    )
+    from PySide6.QtWidgets import (
+        QApplication, QDialog, QFrame, QGraphicsPolygonItem, QGraphicsPathItem,
+        QGraphicsLineItem, QGraphicsScene, QGraphicsView, QHBoxLayout,
+        QLabel, QPushButton, QVBoxLayout,
+    )
+    from shapely.ops import unary_union
+
+    PALETTE = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+        "#393b79", "#637939", "#8c6d31", "#843c39", "#7b4173",
+        "#3182bd", "#e6550d", "#31a354", "#756bb1", "#636363",
+    ]
+    lines = lines or []
+    pieces = {pi: fl for pi, fl in faces_per_piece}
+
+    if assembled is not None:
+        r = assembled["global_rect"]
+        x0, y0, x1, y1 = r.x0 - 20, r.y0 - 20, r.x1 + 20, r.y1 + 20
+    else:
+        boxes = [f["bbox"] for fl in pieces.values() for f in fl]
+        if boxes:
+            x0 = min(b[0] for b in boxes) - 20
+            y0 = min(b[1] for b in boxes) - 20
+            x1 = max(b[2] for b in boxes) + 20
+            y1 = max(b[3] for b in boxes) + 20
+        else:
+            x0 = y0 = 0.0
+            x1 = y1 = 1.0
+
+    class FaceItem(QGraphicsPolygonItem):
+        def __init__(self, pi, fi, pts):
+            super().__init__(QPolygonF([QPointF(p[0], p[1]) for p in pts]))
+            self.pi = pi
+            self.fi = fi
+            self.setAcceptHoverEvents(True)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setZValue(1)
+
+        def hoverEnterEvent(self, event):
+            self.scene().picker.hover_piece(self.pi)
+            super().hoverEnterEvent(event)
+
+        def hoverLeaveEvent(self, event):
+            self.scene().picker.schedule_unhover(self.pi)
+            super().hoverLeaveEvent(event)
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+                self.scene().picker.click_face(self.pi, self.fi, alt)
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+    class PatternView(QGraphicsView):
+        def __init__(self, scene):
+            super().__init__(scene)
+            self.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self.setFrameShape(QFrame.Shape.NoFrame)
+            self.setBackgroundBrush(QColor("#f3f3f3"))
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+            self.setMouseTracking(True)
+            self._panning = False
+            self._pan_pos = None
+
+        def wheelEvent(self, event):
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            self.scale(factor, factor)
+
+        def mousePressEvent(self, event):
+            hit = None
+            for it in self.items(event.pos()):
+                if isinstance(it, FaceItem):
+                    hit = it
+                    break
+            if event.button() == Qt.MouseButton.LeftButton and hit is None:
+                self._panning = True
+                self._pan_pos = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event):
+            if self._panning and self._pan_pos is not None:
+                d = event.pos() - self._pan_pos
+                self._pan_pos = event.pos()
+                self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+                self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+                return
+            super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event):
+            if self._panning:
+                self._panning = False
+                self._pan_pos = None
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                event.accept()
+                return
+            super().mouseReleaseEvent(event)
+
+    class Picker(QDialog):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Select pattern outlines")
+            self.resize(1400, 900)
+            self.active = set()
+            self.off = set()
+            self.hover_pi = None
+            self.output = []
+            self.face_items = []
+            self.outline_items = []
+
+            self.scene = QGraphicsScene(self)
+            self.scene.picker = self
+            self.scene.setSceneRect(x0, y0, x1 - x0, y1 - y0)
+            self.view = PatternView(self.scene)
+
+            for pi, fl in faces_per_piece:
+                for fi, face in enumerate(fl):
+                    item = FaceItem(pi, fi, face["points"])
+                    self.scene.addItem(item)
+                    self.face_items.append(item)
+
+            for obj in lines:
+                color = QColor("#e31a1c" if obj["type"] == "grain" else "#6a3d9a")
+                pen = QPen(color)
+                pen.setCosmetic(True)
+                pen.setWidthF(2.0)
+                for a, b in obj.get("all_segments") or []:
+                    ln = QGraphicsLineItem(a[0], a[1], b[0], b[1])
+                    ln.setPen(pen)
+                    ln.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    ln.setZValue(8)
+                    self.scene.addItem(ln)
+
+            hint = QLabel(
+                "Red = grain, purple = fold. Hover highlights a piece. "
+                "Click selects it. Click an inner face to toggle it. "
+                "Alt-click drops the piece. Drag the background to pan, wheel to zoom."
+            )
+            hint.setWordWrap(True)
+            self.status = QLabel()
+
+            all_btn = QPushButton("All")
+            clear_btn = QPushButton("Clear")
+            approve = QPushButton("Approve")
+            cancel = QPushButton("Cancel")
+            approve.setObjectName("approve")
+            all_btn.clicked.connect(self.select_all)
+            clear_btn.clicked.connect(self.clear)
+            approve.clicked.connect(self.approve)
+            cancel.clicked.connect(self.reject)
+
+            row = QHBoxLayout()
+            row.addWidget(all_btn)
+            row.addWidget(clear_btn)
+            row.addStretch(1)
+            row.addWidget(cancel)
+            row.addWidget(approve)
+
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(10, 10, 10, 10)
+            lay.addWidget(hint)
+            lay.addWidget(self.view, 1)
+            lay.addLayout(row)
+            lay.addWidget(self.status)
+            self.restyle_all()
+            self.update_status()
+
+        def showEvent(self, event):
+            super().showEvent(event)
+            self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+        def color_for(self, pi, alpha):
+            c = QColor(PALETTE[pi % len(PALETTE)])
+            c.setAlpha(alpha)
+            return c
+
+        def restyle_all(self):
+            for it in self.face_items:
+                self.apply_style(it)
+            self.refresh_outlines()
+            self.update_status()
+
+        def restyle_piece(self, pi):
+            for it in self.face_items:
+                if it.pi == pi:
+                    self.apply_style(it)
+
+        def apply_style(self, it):
+            on_piece = it.pi in self.active
+            face_on = on_piece and (it.pi, it.fi) not in self.off
+            hovered = it.pi == self.hover_pi
+            if on_piece and face_on:
+                alpha = 210 if hovered else 175
+            elif hovered:
+                alpha = 120
+            else:
+                alpha = 40
+            it.setBrush(QBrush(self.color_for(it.pi, alpha)))
+            pen = QPen(QColor(40, 40, 40, 200 if face_on else 90))
+            pen.setCosmetic(True)
+            pen.setWidthF(1.6 if face_on else 0.9)
+            it.setPen(pen)
+
+        def hover_piece(self, pi):
+            if self.hover_pi == pi:
+                return
+            old = self.hover_pi
+            self.hover_pi = pi
+            if old is not None:
+                self.restyle_piece(old)
+            self.restyle_piece(pi)
+
+        def schedule_unhover(self, pi):
+            def check():
+                if self.hover_pi != pi:
+                    return
+                pos = self.view.mapFromGlobal(self.cursor().pos())
+                still = any(
+                    isinstance(it, FaceItem) and it.pi == pi
+                    for it in self.view.items(pos)
+                )
+                if still:
+                    return
+                self.hover_pi = None
+                self.restyle_piece(pi)
+            QTimer.singleShot(0, check)
+
+        def click_face(self, pi, fi, alt):
+            if alt:
+                self.active.discard(pi)
+                self.off = {k for k in self.off if k[0] != pi}
+            elif pi not in self.active:
+                self.active.add(pi)
+            else:
+                key = (pi, fi)
+                if key in self.off:
+                    self.off.remove(key)
+                else:
+                    self.off.add(key)
+                fl = pieces[pi]
+                if all((pi, i) in self.off for i in range(len(fl))):
+                    self.active.discard(pi)
+                    self.off = {k for k in self.off if k[0] != pi}
+            self.restyle_all()
+
+        def select_all(self):
+            self.off.clear()
+            self.active = {pi for pi, _fl in faces_per_piece}
+            self.restyle_all()
+
+        def clear(self):
+            self.active.clear()
+            self.off.clear()
+            self.restyle_all()
+
+        def refresh_outlines(self):
+            for it in self.outline_items:
+                self.scene.removeItem(it)
+            self.outline_items.clear()
+            for pi in self.active:
+                fl = pieces[pi]
+                polys = [fl[fi]["polygon"] for fi in range(len(fl)) if (pi, fi) not in self.off]
+                if not polys:
+                    continue
+                try:
+                    u = unary_union(polys)
+                except Exception:
+                    continue
+                if u.geom_type == "MultiPolygon":
+                    u = max(u.geoms, key=lambda g: g.area)
+                if u.geom_type != "Polygon":
+                    continue
+                path = QPainterPath()
+                coords = list(u.exterior.coords)
+                path.moveTo(coords[0][0], coords[0][1])
+                for x, y in coords[1:]:
+                    path.lineTo(x, y)
+                path.closeSubpath()
+                glow = QGraphicsPathItem(path)
+                gpen = QPen(QColor(255, 255, 255, 180))
+                gpen.setCosmetic(True)
+                gpen.setWidthF(6)
+                glow.setPen(gpen)
+                glow.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                glow.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                glow.setZValue(5)
+                core = QGraphicsPathItem(path)
+                cpen = QPen(QColor(0, 0, 0))
+                cpen.setCosmetic(True)
+                cpen.setWidthF(2.4)
+                core.setPen(cpen)
+                core.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                core.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                core.setZValue(6)
+                self.scene.addItem(glow)
+                self.scene.addItem(core)
+                self.outline_items.extend((glow, core))
+
+        def update_status(self):
+            total = sum(len(fl) for fl in pieces.values())
+            n = 0
+            for pi, fl in pieces.items():
+                if pi in self.active:
+                    n += sum(1 for fi in range(len(fl)) if (pi, fi) not in self.off)
+            self.status.setText(
+                f"Pieces {len(self.active)}/{len(pieces)}    faces {n}/{total}"
+            )
+
+        def build_result(self):
+            result = []
+            for pi, fl in faces_per_piece:
+                if pi not in self.active:
+                    continue
+                chosen = [fi for fi in range(len(fl)) if (pi, fi) not in self.off]
+                polys = [fl[fi]["polygon"] for fi in chosen]
+                if not polys:
+                    continue
+                try:
+                    u = unary_union(polys)
+                    if u.is_empty:
+                        continue
+                    if u.geom_type == "MultiPolygon":
+                        u = max(u.geoms, key=lambda g: g.area)
+                    if u.geom_type != "Polygon":
+                        continue
+                    coords = list(u.exterior.coords)
+                    result.append({
+                        "segments": [(coords[i], coords[i + 1]) for i in range(len(coords) - 1)],
+                        "points": coords[:-1],
+                        "area": float(u.area),
+                        "bbox": u.bounds,
+                        "source_piece": pi,
+                        "selected_faces": chosen,
+                        "closed": True,
+                        "size_variants": [],
+                        "path_ids": [],
+                        "perimeter": float(u.length),
+                    })
+                except Exception:
+                    continue
+            return result
+
+        def approve(self):
+            self.output = self.build_result()
+            self.accept()
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet("""
+        QDialog { background: #fafafa; }
+        QLabel { color: #222; font-size: 13px; }
+        QPushButton {
+            background: white; border: 1px solid #ccc; border-radius: 6px;
+            padding: 6px 14px; font-size: 13px;
+        }
+        QPushButton:hover { background: #f0f0f0; }
+        QPushButton#approve { background: #1f6feb; color: white; border: none; }
+        QPushButton#approve:hover { background: #1858c4; }
+    """)
+    dlg = Picker()
+    dlg.exec()
+    return dlg.output
+
+
 def select_faces_interactive(page, faces_per_piece, assembled=None):
     selector = FaceSelector(page, faces_per_piece, assembled=assembled)
     return selector.run()
@@ -2475,10 +2872,15 @@ def main():
         print(f"    piece {pi}: {len(fl)} face(s)")
 
     print("\n=== Interactive face selection ===")
-    print("Click faces to toggle.  Enter/d=done  a=all  c=clear  Esc=cancel")
-    selected = select_faces_interactive(
-        page, faces_per_piece, assembled=assembled_pat,
+    print("Hover highlights a piece. Click selects it.")
+    print("Click again toggles an inner face. Alt-click drops the piece.")
+    print("Drag empty background to pan. Wheel to zoom.")
+    selected = select_faces_pyside6(
+        faces_per_piece,
+        lines,
+        assembled=assembled_pat,
     )
+
     print(f"Selected outlines: {len(selected)}")
     for i, p in enumerate(selected):
         print(f"  [{i}] area={p['area']:.0f}  peri={p['perimeter']:.0f}")
