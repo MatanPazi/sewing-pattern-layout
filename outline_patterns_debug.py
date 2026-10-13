@@ -1262,39 +1262,68 @@ def step5_polygonize(noded, out_dir: Path, stem: str, min_face_area: float = 400
 
 
 def step_write_selected(selected, out_dir: Path, stem: str):
+    import json
+    fabrics = selected.get("fabrics", []) if isinstance(selected, dict) else []
+
     summary_path = out_dir / f"{stem}_selected_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("SELECTED – combined outlines\n")
-        f.write(f"  pieces : {len(selected)}\n")
-        for i, p in enumerate(selected):
+        f.write("SELECTED – fabrics and combined outlines\n")
+        f.write(f"  fabrics : {len(fabrics)}\n\n")
+        for fi, fab in enumerate(fabrics):
+            pieces = fab.get("pieces") or []
             f.write(
-                f"  [{i}] area={p.get('area', 0):.0f}  peri={p.get('perimeter', 0):.1f}  "
-                f"pts={len(p.get('points') or [])}  bbox={p.get('bbox')}\n"
+                f"FABRIC {fi}  name={fab['name']}  "
+                f"width={fab['width']} {fab.get('width_unit', 'cm')}  "
+                f"directional={fab['directional']}\n"
             )
-            f.write(f"      segments ({len(p.get('segments') or [])}):\n")
-            for s in p.get("segments") or []:
-                f.write(f"        {s[0]} -> {s[1]}\n")
+            f.write(f"  pieces : {len(pieces)}\n")
+            for i, p in enumerate(pieces):
+                f.write(
+                    f"  [{i}] copies={p.get('copies', 1)}  area={p.get('area', 0):.0f}  "
+                    f"peri={p.get('perimeter', 0):.1f}  "
+                    f"faces={p.get('selected_faces')}  pts={len(p.get('points') or [])}  "
+                    f"bbox={p.get('bbox')}\n"
+                )
+                f.write(f"      segments ({len(p.get('segments') or [])}):\n")
+                for s in p.get("segments") or []:
+                    f.write(f"        {s[0]} -> {s[1]}\n")
+            f.write("\n")
     print(f"SELECTED summary → {summary_path}")
 
-    json_path = out_dir / f"{stem}_selected.json"
     payload = []
-    for i, p in enumerate(selected):
+    for fab in fabrics:
+        pieces_out = []
+        for i, p in enumerate(fab.get("pieces") or []):
+            pieces_out.append({
+                "index": i,
+                "source_piece": p.get("source_piece"),
+                "copies": int(p.get("copies") or 1),
+                "area": p.get("area"),
+                "perimeter": p.get("perimeter"),
+                "bbox": [float(x) for x in (p.get("bbox") or ())],
+                "selected_faces": p.get("selected_faces") or [],
+                "points": [[float(x), float(y)] for x, y in (p.get("points") or [])],
+            })
         payload.append({
-            "index": i,
-            "source_piece": p.get("source_piece"),
-            "area": p.get("area"),
-            "perimeter": p.get("perimeter"),
-            "bbox": [float(x) for x in (p.get("bbox") or ())],
-            "selected_faces": p.get("selected_faces") or [],
-            "points": [[float(x), float(y)] for x, y in (p.get("points") or [])],
+            "name": fab["name"],
+            "width": fab["width"],
+            "width_unit": fab.get("width_unit", "cm"),
+            "directional": fab["directional"],
+            "pieces": pieces_out,
         })
+    json_path = out_dir / f"{stem}_selected.json"
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"pieces": payload}, f, indent=2)
+        json.dump({"fabrics": payload}, f, indent=2)
     print(f"SELECTED json    → {json_path}")
 
-    png_path = out_dir / f"{stem}_selected.png"
-    _draw_selected_debug(selected, png_path)
-    print(f"SELECTED image   → {png_path}")
+    for fab in fabrics:
+        pieces = fab.get("pieces") or []
+        if not pieces:
+            continue
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in fab["name"])
+        png_path = out_dir / f"{stem}_selected_{safe or 'fabric'}.png"
+        _draw_selected_debug(pieces, png_path, title=f"SELECTED – {fab['name']}")
+        print(f"SELECTED image   → {png_path}")
 
 
 def group_faces_into_pieces(faces, min_shared_edge: float = 1.0):
@@ -1586,7 +1615,7 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
     plt.close()
 
 
-def _draw_selected_debug(selected, out_path: Path):
+def _draw_selected_debug(selected, out_path: Path, title="SELECTED – combined outlines"):
     if not selected:
         return
     xs0, ys0, xs1, ys1 = zip(*[p["bbox"] for p in selected])
@@ -1597,7 +1626,7 @@ def _draw_selected_debug(selected, out_path: Path):
     ax.set_ylim(y1 + 20, y0 - 20)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title("SELECTED – combined outlines", fontsize=11)
+    ax.set_title(title, fontsize=11)
     try:
         cmap = mpl.colormaps["tab10"]
     except (AttributeError, KeyError):
@@ -1935,9 +1964,11 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF,
     )
     from PySide6.QtWidgets import (
-        QApplication, QDialog, QFrame, QGraphicsPolygonItem, QGraphicsPathItem,
-        QGraphicsLineItem, QGraphicsScene, QGraphicsView, QHBoxLayout,
-        QLabel, QPushButton, QVBoxLayout,
+        QApplication, QCheckBox, QDialog, QDoubleSpinBox, QFrame,
+        QGraphicsPolygonItem, QGraphicsPathItem, QGraphicsLineItem,
+        QGraphicsScene, QGraphicsView, QGridLayout, QGroupBox, QHBoxLayout,
+        QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+        QVBoxLayout, QWidget,
     )
     from shapely.ops import unary_union
 
@@ -2032,12 +2063,14 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
             super().mouseReleaseEvent(event)
 
     class Picker(QDialog):
-        def __init__(self):
+        def __init__(self, subtitle="", initial_active=None, initial_off=None):
             super().__init__()
-            self.setWindowTitle("Select pattern outlines")
+            self.setWindowTitle(
+                "Select pattern outlines" + (f" — {subtitle}" if subtitle else "")
+            )
             self.resize(1400, 900)
-            self.active = set()
-            self.off = set()
+            self.active = set(initial_active or [])
+            self.off = set(initial_off or [])
             self.hover_pi = None
             self.output = []
             self.face_items = []
@@ -2067,7 +2100,8 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                     self.scene.addItem(ln)
 
             hint = QLabel(
-                "Red = grain, purple = fold. Hover highlights a piece. "
+                (subtitle + "\n\n" if subtitle else "")
+                + "Red = grain, purple = fold. Hover highlights a piece. "
                 "Click selects it. Click an inner face to toggle it. "
                 "Alt-click drops the piece. Drag the background to pan, wheel to zoom."
             )
@@ -2279,6 +2313,99 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
             self.output = self.build_result()
             self.accept()
 
+    def ask_fabrics():
+        class FabricDialog(QDialog):
+            def __init__(self):
+                super().__init__()
+                self.setWindowTitle("Fabrics")
+                self.resize(520, 460)
+                self.specs = []
+                self.rows = []
+
+                self.count = QSpinBox()
+                self.count.setRange(1, 12)
+                self.count.setValue(1)
+
+                self.form = QVBoxLayout()
+                inner = QWidget()
+                inner.setLayout(self.form)
+                scroll = QScrollArea()
+                scroll.setWidgetResizable(True)
+                scroll.setWidget(inner)
+
+                cont = QPushButton("Continue")
+                cont.setObjectName("approve")
+                cancel = QPushButton("Cancel")
+                cont.clicked.connect(self.finish)
+                cancel.clicked.connect(self.reject)
+                row = QHBoxLayout()
+                row.addStretch(1)
+                row.addWidget(cancel)
+                row.addWidget(cont)
+
+                lay = QVBoxLayout(self)
+                lay.addWidget(QLabel("How many fabrics do you want to use?"))
+                lay.addWidget(self.count)
+                lay.addWidget(scroll, 1)
+                lay.addLayout(row)
+                self.rebuild()
+                self.count.valueChanged.connect(self.rebuild)
+
+            def rebuild(self):
+                old = [
+                    (name.text(), width.value(), direc.isChecked())
+                    for name, width, direc in self.rows
+                ]
+                while self.form.count():
+                    item = self.form.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+                self.rows = []
+                for i in range(self.count.value()):
+                    box = QGroupBox(f"Fabric {i + 1}")
+                    grid = QGridLayout(box)
+                    name = QLineEdit(old[i][0] if i < len(old) else f"Fabric {i + 1}")
+                    width = QDoubleSpinBox()
+                    width.setRange(10, 500)
+                    width.setDecimals(1)
+                    width.setSuffix(" cm")
+                    width.setValue(old[i][1] if i < len(old) else 140.0)
+                    direc = QCheckBox("Directional print")
+                    if i < len(old):
+                        direc.setChecked(old[i][2])
+                    grid.addWidget(QLabel("Name"), 0, 0)
+                    grid.addWidget(name, 0, 1)
+                    grid.addWidget(QLabel("Width"), 1, 0)
+                    grid.addWidget(width, 1, 1)
+                    grid.addWidget(direc, 2, 0, 1, 2)
+                    self.form.addWidget(box)
+                    self.rows.append((name, width, direc))
+                self.form.addStretch(1)
+
+            def finish(self):
+                specs, names = [], []
+                for name, width, direc in self.rows:
+                    n = name.text().strip()
+                    if not n:
+                        QMessageBox.warning(self, "Fabrics", "Every fabric needs a name.")
+                        return
+                    if n in names:
+                        QMessageBox.warning(self, "Fabrics", f"Duplicate name: {n}")
+                        return
+                    names.append(n)
+                    specs.append({
+                        "name": n,
+                        "width": float(width.value()),
+                        "directional": bool(direc.isChecked()),
+                    })
+                self.specs = specs
+                self.accept()
+
+        dlg = FabricDialog()
+        if dlg.exec() != QDialog.Accepted:
+            return []
+        return dlg.specs
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet("""
@@ -2292,9 +2419,216 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         QPushButton#approve { background: #1f6feb; color: white; border: none; }
         QPushButton#approve:hover { background: #1858c4; }
     """)
-    dlg = Picker()
-    dlg.exec()
-    return dlg.output
+
+    specs = ask_fabrics()
+    if not specs:
+        return {"fabrics": []}
+
+    def ask_copies(spec, pieces, previous):
+        class CopyView(QGraphicsView):
+            def __init__(self, scene, on_move):
+                super().__init__(scene)
+                self.on_move = on_move
+                self.setRenderHint(QPainter.RenderHint.Antialiasing)
+                self.setFrameShape(QFrame.Shape.NoFrame)
+                self.setBackgroundBrush(QColor("#f3f3f3"))
+                self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+                self._panning = False
+                self._pan_pos = None
+
+            def wheelEvent(self, event):
+                factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+                self.scale(factor, factor)
+                self.on_move()
+
+            def mousePressEvent(self, event):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self._panning = True
+                    self._pan_pos = event.pos()
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                    event.accept()
+                    return
+                super().mousePressEvent(event)
+
+            def mouseMoveEvent(self, event):
+                if self._panning and self._pan_pos is not None:
+                    d = event.pos() - self._pan_pos
+                    self._pan_pos = event.pos()
+                    self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+                    self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+                    self.on_move()
+                    return
+                super().mouseMoveEvent(event)
+
+            def mouseReleaseEvent(self, event):
+                if self._panning:
+                    self._panning = False
+                    self._pan_pos = None
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                    self.on_move()
+                    event.accept()
+                    return
+                super().mouseReleaseEvent(event)
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                self.on_move()
+
+            def scrollContentsBy(self, dx, dy):
+                super().scrollContentsBy(dx, dy)
+                self.on_move()
+
+        class CopiesDialog(QDialog):
+            def __init__(self):
+                super().__init__()
+                self.setWindowTitle(f"Copies — {spec['name']}")
+                self.resize(1100, 800)
+                self.went_back = False
+                self.spins = []
+                self.badges = []
+                self.anchors = []
+                self.polys = []
+
+                self.scene = QGraphicsScene(self)
+                self.view = CopyView(self.scene, self.place_editors)
+                boxes = [p["bbox"] for p in pieces if p.get("bbox")]
+                if boxes:
+                    x0 = min(b[0] for b in boxes) - 40
+                    y0 = min(b[1] for b in boxes) - 40
+                    x1 = max(b[2] for b in boxes) + 40
+                    y1 = max(b[3] for b in boxes) + 40
+                    self.scene.setSceneRect(x0, y0, x1 - x0, y1 - y0)
+
+                for i, p in enumerate(pieces):
+                    pts = p.get("points") or []
+                    if len(pts) < 3:
+                        self.polys.append(None)
+                        continue
+                    item = QGraphicsPolygonItem(QPolygonF([QPointF(x, y) for x, y in pts]))
+                    colour = QColor("#4c78a8")
+                    colour.setAlpha(160)
+                    item.setBrush(QBrush(colour))
+                    pen = QPen(QColor(0, 0, 0))
+                    pen.setCosmetic(True)
+                    pen.setWidthF(2.2)
+                    item.setPen(pen)
+                    item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    self.scene.addItem(item)
+                    self.polys.append(item)
+
+                    cx = sum(x for x, y in pts) / len(pts)
+                    cy = sum(y for x, y in pts) / len(pts)
+                    badge = QLabel(str(i), self.view.viewport())
+                    badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    badge.setFixedSize(28, 28)
+                    badge.setStyleSheet(
+                        "background:#1f6feb; color:white; border-radius:14px; "
+                        "font-weight:700; font-size:13px;"
+                    )
+                    spin = QSpinBox(self.view.viewport())
+                    spin.setRange(1, 99)
+                    spin.setFixedWidth(72)
+                    spin.setValue(int(previous.get(p.get("source_piece"), 1)))
+                    spin.editingFinished.connect(lambda i=i: self.flash(i))
+                    self.badges.append(badge)
+                    self.spins.append(spin)
+                    self.anchors.append((cx, cy, badge, spin))
+
+                back = QPushButton("Back")
+                cont = QPushButton("Continue")
+                cont.setObjectName("approve")
+                back.clicked.connect(self.go_back)
+                cont.clicked.connect(self.accept)
+                buttons = QHBoxLayout()
+                buttons.addWidget(back)
+                buttons.addStretch(1)
+                buttons.addWidget(cont)
+
+                lay = QVBoxLayout(self)
+                lay.addWidget(QLabel(
+                    f"{spec['name']}: set how many copies to cut. "
+                    "The number sits on the piece. Drag to pan, wheel to zoom."
+                ))
+                if not pieces:
+                    lay.addWidget(QLabel("Nothing selected. Go back, or continue to skip this fabric."))
+                lay.addWidget(self.view, 1)
+                lay.addLayout(buttons)
+
+            def showEvent(self, event):
+                super().showEvent(event)
+                self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+                self.place_editors()
+
+            def place_editors(self):
+                vp = self.view.viewport().rect()
+                for cx, cy, badge, spin in self.anchors:
+                    pt = self.view.mapFromScene(QPointF(cx, cy))
+                    x, y = int(pt.x()), int(pt.y())
+                    visible = vp.contains(x, y)
+                    badge.setVisible(visible)
+                    spin.setVisible(visible)
+                    if not visible:
+                        continue
+                    badge.move(x - badge.width() // 2, y - badge.height() // 2)
+                    spin.move(x + badge.width() // 2 + 6, y - spin.height() // 2)
+                    badge.raise_()
+                    spin.raise_()
+
+            def flash(self, index):
+                for i, item in enumerate(self.polys):
+                    if item is None:
+                        continue
+                    colour = QColor("#1f6feb" if i == index else "#4c78a8")
+                    colour.setAlpha(210 if i == index else 150)
+                    item.setBrush(QBrush(colour))
+
+            def go_back(self):
+                self.went_back = True
+                self.reject()
+
+            def values(self):
+                return [int(s.value()) for s in self.spins]
+
+        dlg = CopiesDialog()
+        if dlg.exec() == QDialog.Accepted:
+            return dlg.values()
+        if dlg.went_back:
+            return None
+        return "cancel"
+
+    fabrics_out = []
+    for i, spec in enumerate(specs):
+        kind = "directional" if spec["directional"] else "non-directional"
+        subtitle = (
+            f"Fabric {i + 1}/{len(specs)}: {spec['name']} "
+            f"({spec['width']:.0f} cm, {kind})"
+        )
+        remembered_active = set()
+        remembered_off = set()
+        remembered_copies = {}
+        while True:
+            dlg = Picker(subtitle, remembered_active, remembered_off)
+            if dlg.exec() != QDialog.Accepted:
+                return {"fabrics": []}
+            remembered_active = set(dlg.active)
+            remembered_off = set(dlg.off)
+            choice = ask_copies(spec, dlg.output, remembered_copies)
+            if choice is None:
+                continue
+            if choice == "cancel":
+                return {"fabrics": []}
+            for p, n in zip(dlg.output, choice):
+                p["copies"] = n
+                remembered_copies[p.get("source_piece")] = n
+            fabrics_out.append({
+                "name": spec["name"],
+                "width": spec["width"],
+                "width_unit": "cm",
+                "directional": spec["directional"],
+                "pieces": dlg.output,
+            })
+            break
+    return {"fabrics": fabrics_out}
 
 
 def select_faces_interactive(page, faces_per_piece, assembled=None):
@@ -2875,10 +3209,17 @@ def main():
         assembled=assembled_pat,
     )
 
-    print(f"Selected outlines: {len(selected)}")
-    for i, p in enumerate(selected):
-        print(f"  [{i}] area={p['area']:.0f}  peri={p['perimeter']:.0f}")
+    fabrics = selected.get("fabrics", [])
+    print(f"Fabrics: {len(fabrics)}")
+    for fab in fabrics:
+        print(
+            f"  {fab['name']}: width={fab['width']} {fab['width_unit']}  "
+            f"directional={fab['directional']}  pieces={len(fab['pieces'])}"
+        )
+        for i, p in enumerate(fab["pieces"]):
+            print(f"    [{i}] area={p['area']:.0f}  peri={p['perimeter']:.0f}")
 
+    print(f"    [{i}] copies={p.get('copies', 1)}  area={p['area']:.0f}  peri={p['perimeter']:.0f}")
     step_write_selected(selected, out_dir, stem)
     
     pattern_doc.close()
