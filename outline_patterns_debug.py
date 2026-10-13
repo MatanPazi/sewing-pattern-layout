@@ -3212,6 +3212,32 @@ def ask_pdf_layers(layers):
         return None
     return dlg.choice
 
+def filter_lines_inside_pieces(lines, faces, tol=20.0):
+    """
+    Drop grain/fold marks that do not sit on a pattern piece.
+    The shaft must lie mostly inside the pieces, expanded by tol,
+    so a fold drawn on the edge still counts. Arrows are not tested.
+    """
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union
+
+    if not lines or not faces:
+        return []
+    region = unary_union([f["polygon"] for f in faces]).buffer(tol)
+    kept = []
+    for obj in lines:
+        parts = []
+        for a, b in obj.get("shaft", {}).get("segments") or []:
+            if dist(a, b) < 1e-9:
+                continue
+            parts.append(LineString([tuple(a), tuple(b)]))
+        if not parts:
+            continue
+        shaft = unary_union(parts)
+        hit = region.intersection(shaft)
+        if not hit.is_empty and hit.length >= 0.5 * shaft.length:
+            kept.append(obj)
+    return kept
 
 def main():
     parser = argparse.ArgumentParser(
@@ -3346,6 +3372,20 @@ def main():
     print(f"  pieces={len(faces_per_piece)}")
     for pi, fl in faces_per_piece:
         print(f"    piece {pi}: {len(fl)} face(s)")
+
+    raw_n = len(lines)
+    lines = filter_lines_inside_pieces(lines, faces, tol=20.0)
+    print(f"  lines inside pieces: {len(lines)}/{raw_n}")
+    _draw_lines_debug(
+        page_lines, lines, out_dir / f"{stem}_lines.png", assembled=assembled_lines,
+    )
+    with open(out_dir / f"{stem}_lines_summary.txt", "a", encoding="utf-8") as f:
+        f.write(f"\nKept inside a pattern piece: {len(lines)}/{raw_n}  tol=20\n")
+        for i, obj in enumerate(lines):
+            f.write(
+                f"  kept [{i}] {obj['type']}  "
+                f"endpoints={obj['shaft']['endpoints']}\n"
+            )        
 
     print("\n=== Interactive face selection ===")
     print("Hover highlights a piece. Click selects it.")
