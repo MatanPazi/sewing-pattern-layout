@@ -1284,6 +1284,14 @@ def step_write_selected(selected, out_dir: Path, stem: str):
                     f"faces={p.get('selected_faces')}  pts={len(p.get('points') or [])}  "
                     f"bbox={p.get('bbox')}\n"
                 )
+                piece_lines = p.get("lines") or []
+                f.write(f"      lines : {len(piece_lines)}\n")
+                for ln in piece_lines:
+                    f.write(
+                        f"        {ln['type']}  angle={ln['angle_deg']:.1f}  "
+                        f"dir={ln['direction']}  length={ln['length']:.1f}  "
+                        f"endpoints={ln['endpoints']}\n"
+                    )                    
                 f.write(f"      segments ({len(p.get('segments') or [])}):\n")
                 for s in p.get("segments") or []:
                     f.write(f"        {s[0]} -> {s[1]}\n")
@@ -1298,6 +1306,7 @@ def step_write_selected(selected, out_dir: Path, stem: str):
                 "index": i,
                 "source_piece": p.get("source_piece"),
                 "copies": int(p.get("copies") or 1),
+                "lines": p.get("lines") or [],
                 "area": p.get("area"),
                 "perimeter": p.get("perimeter"),
                 "bbox": [float(x) for x in (p.get("bbox") or ())],
@@ -3239,6 +3248,65 @@ def filter_lines_inside_pieces(lines, faces, tol=20.0):
             kept.append(obj)
     return kept
 
+def attach_lines_to_selection(selected, lines, tol=20.0):
+    """
+    Copy each kept grain/fold onto the selected piece it lies on.
+    angle_deg is the undirected axis, in [0, 180).
+    """
+    from shapely.geometry import LineString, Polygon
+    from shapely.ops import unary_union
+
+    shafts = []
+    for obj in lines or []:
+        parts = [
+            LineString([tuple(a), tuple(b)])
+            for a, b in obj.get("shaft", {}).get("segments") or []
+            if dist(a, b) >= 1e-9
+        ]
+        if parts:
+            shafts.append((obj, unary_union(parts)))
+
+    def record(obj):
+        a, b = obj["shaft"]["endpoints"]
+        dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
+        length = math.hypot(dx, dy) or 1.0
+        if dx < 0 or (abs(dx) < 1e-9 and dy < 0):
+            dx, dy = -dx, -dy
+        return {
+            "type": obj["type"],
+            "endpoints": [[float(a[0]), float(a[1])], [float(b[0]), float(b[1])]],
+            "direction": [dx / length, dy / length],
+            "angle_deg": math.degrees(math.atan2(dy, dx)) % 180.0,
+            "length": float(obj["shaft"].get("length") or length),
+        }
+
+    for fab in selected.get("fabrics", []):
+        pieces = fab.get("pieces") or []
+        regions = []
+        for p in pieces:
+            p["lines"] = []
+            pts = p.get("points") or []
+            if len(pts) < 3:
+                regions.append(None)
+                continue
+            poly = Polygon([(float(x), float(y)) for x, y in pts])
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            regions.append(poly.buffer(tol))
+        for obj, shaft in shafts:
+            best_i, best_len = None, 0.0
+            for i, region in enumerate(regions):
+                if region is None:
+                    continue
+                hit = region.intersection(shaft)
+                if hit.is_empty or hit.length < 0.5 * shaft.length:
+                    continue
+                if hit.length > best_len:
+                    best_i, best_len = i, hit.length
+            if best_i is not None:
+                pieces[best_i]["lines"].append(record(obj))
+    return selected
+
 def main():
     parser = argparse.ArgumentParser(
         description="Choose layers, assemble pages, then debug steps 1–5 + UI"
@@ -3407,9 +3475,12 @@ def main():
         for i, p in enumerate(fab["pieces"]):
             print(
                 f"    [{i}] copies={p.get('copies', 1)}  "
-                f"area={p['area']:.0f}  peri={p['perimeter']:.0f}"
+                f"area={p['area']:.0f}  peri={p['perimeter']:.0f}  "
+                f"lines={[ln['type'] for ln in p.get('lines') or []]}"
             )
 
+    attach_lines_to_selection(selected, lines, tol=20.0)
+    
     step_write_selected(selected, out_dir, stem)
     
     pattern_doc.close()
