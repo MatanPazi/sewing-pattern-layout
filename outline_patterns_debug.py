@@ -3,7 +3,7 @@
 outline_patterns_debug.py
 
 How to run:
-python outline_patterns_debug.py --pattern-pdf PAT.pdf --lines-pdf LINES.pdf --pattern-pages 0-3 --lines-pages 0-3
+python outline_patterns_debug.py --pdf FULL.pdf --pages 0-3
 """
 
 from __future__ import annotations
@@ -3077,14 +3077,148 @@ def parse_page_spec(spec, doc):
     return sorted(set(p for p in pages if 0 <= p < len(doc)))
 
 
+def list_pdf_layers(pdf_path: Path):
+    """Human names of the OCG layers actually used in the file."""
+    import pikepdf
+    layers = []
+    seen = set()
+    with pikepdf.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            try:
+                props = page.Resources.Properties
+            except Exception:
+                continue
+            for key in props.keys():
+                obj = props[key]
+                if hasattr(obj, "get_object"):
+                    obj = obj.get_object()
+                try:
+                    if str(obj.get("/Type")) != "/OCG":
+                        continue
+                except Exception:
+                    continue
+                key_s = str(key)
+                if key_s in seen:
+                    continue
+                seen.add(key_s)
+                layers.append({"key": key_s, "name": str(obj.get("/Name", key_s))})
+    layers.sort(key=lambda layer: layer["name"].lower())
+    return layers
+
+
+def extract_one_layer(pdf_path: Path, ocg_key: str, out_path: Path):
+    """
+    Write a PDF that keeps one layer, plus anything drawn outside a layer
+    (page frames). Same filter as pdf_process.py, for a single layer.
+    """
+    import pikepdf
+    with pikepdf.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            commands = []
+            extract_commands = True
+            for operands, operator in pikepdf.parse_content_stream(page):
+                op_str = str(operator)
+                is_oc_start = (
+                    op_str == "BDC"
+                    and len(operands) >= 2
+                    and str(operands[0]) == "/OC"
+                )
+                if is_oc_start:
+                    extract_commands = str(operands[1]) == ocg_key
+                    commands.append([operands, operator])
+                    continue
+                if op_str == "EMC":
+                    commands.append([operands, operator])
+                    extract_commands = True
+                    continue
+                if extract_commands:
+                    commands.append([operands, operator])
+            page.Contents = pdf.make_stream(pikepdf.unparse_content_stream(commands))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        pdf.save(out_path)
+
+
+def ask_pdf_layers(layers):
+    """Two dropdowns. Returns {pattern_key, pattern_name, lines_key, lines_name} or None."""
+    import sys
+    from collections import Counter
+    from PySide6.QtWidgets import (
+        QApplication, QComboBox, QDialog, QHBoxLayout, QLabel,
+        QPushButton, QVBoxLayout,
+    )
+
+    counts = Counter(layer["name"] for layer in layers)
+
+    def label_of(layer):
+        if counts[layer["name"]] > 1:
+            return f"{layer['name']}  ({layer['key']})"
+        return layer["name"]
+
+    class LayerDialog(QDialog):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Choose layers")
+            self.resize(460, 220)
+            self.choice = None
+            self.pattern_box = QComboBox()
+            self.lines_box = QComboBox()
+            for layer in layers:
+                text = label_of(layer)
+                self.pattern_box.addItem(text, layer)
+                self.lines_box.addItem(text, layer)
+
+            line_guess = 0
+            for i, layer in enumerate(layers):
+                n = layer["name"].lower()
+                if any(word in n for word in ("grain", "fold", "arrow", "line")):
+                    line_guess = i
+                    break
+            self.pattern_box.setCurrentIndex(0 if line_guess != 0 else min(1, len(layers) - 1))
+            self.lines_box.setCurrentIndex(line_guess)
+
+            cont = QPushButton("Continue")
+            cont.setObjectName("approve")
+            cancel = QPushButton("Cancel")
+            cont.clicked.connect(self.finish)
+            cancel.clicked.connect(self.reject)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(cancel)
+            row.addWidget(cont)
+
+            lay = QVBoxLayout(self)
+            lay.addWidget(QLabel("Pattern size layer"))
+            lay.addWidget(self.pattern_box)
+            lay.addWidget(QLabel("Grain / fold layer"))
+            lay.addWidget(self.lines_box)
+            lay.addStretch(1)
+            lay.addLayout(row)
+
+        def finish(self):
+            pattern = self.pattern_box.currentData()
+            lines = self.lines_box.currentData()
+            self.choice = {
+                "pattern_key": pattern["key"],
+                "pattern_name": pattern["name"],
+                "lines_key": lines["key"],
+                "lines_name": lines["name"],
+            }
+            self.accept()
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+    dlg = LayerDialog()
+    if dlg.exec() != QDialog.Accepted:
+        return None
+    return dlg.choice
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Assemble multi-page pattern, then debug steps 1–5 + UI"
+        description="Choose layers, assemble pages, then debug steps 1–5 + UI"
     )
-    parser.add_argument("--pattern-pdf", type=Path, required=True)
-    parser.add_argument("--lines-pdf", type=Path, required=True)
-    parser.add_argument("--pattern-pages", type=str, default=None)
-    parser.add_argument("--lines-pages", type=str, default=None)
+    parser.add_argument("--pdf", type=Path, required=True)
+    parser.add_argument("--pages", type=str, default=None, help="e.g. 0-3 or 0,2")
     parser.add_argument("--overlap", type=float, default=0.0)
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--min-seg-length", type=float, default=2.0)
@@ -3095,29 +3229,43 @@ def main():
     parser.add_argument("--min-face-area", type=float, default=400.0)
     args = parser.parse_args()
 
-    if not args.pattern_pdf.is_file():
-        raise SystemExit(f"Pattern PDF not found: {args.pattern_pdf}")
-    if not args.lines_pdf.is_file():
-        raise SystemExit(f"Lines PDF not found: {args.lines_pdf}")
+    if not args.pdf.is_file():
+        raise SystemExit(f"PDF not found: {args.pdf}")
 
-    pattern_doc = fitz.open(args.pattern_pdf)
-    instr_doc = fitz.open(args.lines_pdf)
+    out_dir = args.out_dir or (args.pdf.parent / "debug_outline")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{args.pdf.stem}_assembled"
 
-    pat_pages = parse_page_spec(args.pattern_pages, pattern_doc)
-    line_pages = parse_page_spec(args.lines_pages, instr_doc)
+    layers = list_pdf_layers(args.pdf)
+    if not layers:
+        raise SystemExit(f"No layers found in {args.pdf.name}")
+    print("Layers:")
+    for layer in layers:
+        print(f"  {layer['name']}  ({layer['key']})")
+
+    choice = ask_pdf_layers(layers)
+    if not choice:
+        raise SystemExit("Layer selection cancelled")
+    print(f"Pattern layer : {choice['pattern_name']}")
+    print(f"Lines layer   : {choice['lines_name']}")
+
+    pattern_path = out_dir / "layer_pattern.pdf"
+    lines_path = out_dir / "layer_lines.pdf"
+    extract_one_layer(args.pdf, choice["pattern_key"], pattern_path)
+    extract_one_layer(args.pdf, choice["lines_key"], lines_path)
+    print(f"Wrote {pattern_path.name} and {lines_path.name}")
+
+    pattern_doc = fitz.open(pattern_path)
+    instr_doc = fitz.open(lines_path)
+    pat_pages = parse_page_spec(args.pages, pattern_doc)
+    line_pages = parse_page_spec(args.pages, instr_doc)
     if not pat_pages:
         raise SystemExit("No valid pattern pages")
     if not line_pages:
         raise SystemExit("No valid lines pages")
 
-    out_dir = args.out_dir or (args.pattern_pdf.parent / "debug_outline")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{args.pattern_pdf.stem}_assembled"
-
-    print(f"Pattern PDF   : {args.pattern_pdf}")
-    print(f"Lines PDF     : {args.lines_pdf}")
-    print(f"Pattern pages : {pat_pages}")
-    print(f"Lines pages   : {line_pages}")
+    print(f"PDF           : {args.pdf}")
+    print(f"Pages         : {pat_pages}")
     print(f"Out dir       : {out_dir}")
 
     # ----- assemble both PDFs into one canvas -----
@@ -3217,9 +3365,11 @@ def main():
             f"directional={fab['directional']}  pieces={len(fab['pieces'])}"
         )
         for i, p in enumerate(fab["pieces"]):
-            print(f"    [{i}] area={p['area']:.0f}  peri={p['perimeter']:.0f}")
+            print(
+                f"    [{i}] copies={p.get('copies', 1)}  "
+                f"area={p['area']:.0f}  peri={p['perimeter']:.0f}"
+            )
 
-    print(f"    [{i}] copies={p.get('copies', 1)}  area={p['area']:.0f}  peri={p['perimeter']:.0f}")
     step_write_selected(selected, out_dir, stem)
     
     pattern_doc.close()
