@@ -1268,6 +1268,7 @@ def step_write_selected(selected, out_dir: Path, stem: str):
     summary_path = out_dir / f"{stem}_selected_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("SELECTED – fabrics and combined outlines\n")
+        f.write(f"  scale_percent : {selected.get('scale_percent', 100)}\n")
         f.write(f"  fabrics : {len(fabrics)}\n\n")
         for fi, fab in enumerate(fabrics):
             pieces = fab.get("pieces") or []
@@ -1307,6 +1308,7 @@ def step_write_selected(selected, out_dir: Path, stem: str):
                 "source_piece": p.get("source_piece"),
                 "copies": int(p.get("copies") or 1),
                 "lines": p.get("lines") or [],
+                "folded": bool(p.get("folded")),
                 "area": p.get("area"),
                 "perimeter": p.get("perimeter"),
                 "bbox": [float(x) for x in (p.get("bbox") or ())],
@@ -1322,7 +1324,14 @@ def step_write_selected(selected, out_dir: Path, stem: str):
         })
     json_path = out_dir / f"{stem}_selected.json"
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"fabrics": payload}, f, indent=2)
+        json.dump(
+            {
+                "scale_percent": selected.get("scale_percent", 100.0),
+                "fabrics": payload,
+            },
+            f,
+            indent=2,
+        )
     print(f"SELECTED json    → {json_path}")
 
     for fab in fabrics:
@@ -2352,7 +2361,18 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                 row.addWidget(cancel)
                 row.addWidget(cont)
 
+                self.scale = QDoubleSpinBox()
+                self.scale.setRange(10.0, 400.0)
+                self.scale.setDecimals(1)
+                self.scale.setSingleStep(5.0)
+                self.scale.setValue(100.0)
+                self.scale.setSuffix(" %")
+
+
+
                 lay = QVBoxLayout(self)
+                lay.addWidget(QLabel("Pattern scale (100% = true size when the PDF is printed at 100%)"))
+                lay.addWidget(self.scale)                
                 lay.addWidget(QLabel("How many fabrics do you want to use?"))
                 lay.addWidget(self.count)
                 lay.addWidget(scroll, 1)
@@ -2407,13 +2427,17 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                         "width": float(width.value()),
                         "directional": bool(direc.isChecked()),
                     })
+                self.scale_percent = float(self.scale.value())
                 self.specs = specs
                 self.accept()
 
         dlg = FabricDialog()
         if dlg.exec() != QDialog.Accepted:
-            return []
-        return dlg.specs
+            return None
+        return {
+            "scale_percent": float(dlg.scale_percent),
+            "fabric_specs": dlg.specs,
+        }
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -2428,10 +2452,6 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         QPushButton#approve { background: #1f6feb; color: white; border: none; }
         QPushButton#approve:hover { background: #1858c4; }
     """)
-
-    specs = ask_fabrics()
-    if not specs:
-        return {"fabrics": []}
 
     def ask_copies(spec, pieces, previous):
         class CopyView(QGraphicsView):
@@ -2605,6 +2625,13 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
             return None
         return "cancel"
 
+    setup = ask_fabrics()
+    if not setup:
+        return {"scale_percent": 100.0, "fabrics": []}
+
+    scale_percent = setup["scale_percent"]
+    specs = setup["fabric_specs"]
+
     fabrics_out = []
     for i, spec in enumerate(specs):
         kind = "directional" if spec["directional"] else "non-directional"
@@ -2618,14 +2645,14 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         while True:
             dlg = Picker(subtitle, remembered_active, remembered_off)
             if dlg.exec() != QDialog.Accepted:
-                return {"fabrics": []}
+                return {"scale_percent": scale_percent, "fabrics": []}
             remembered_active = set(dlg.active)
             remembered_off = set(dlg.off)
             choice = ask_copies(spec, dlg.output, remembered_copies)
             if choice is None:
                 continue
             if choice == "cancel":
-                return {"fabrics": []}
+                return {"scale_percent": scale_percent, "fabrics": []}
             for p, n in zip(dlg.output, choice):
                 p["copies"] = n
                 remembered_copies[p.get("source_piece")] = n
@@ -2637,7 +2664,11 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                 "pieces": dlg.output,
             })
             break
-    return {"fabrics": fabrics_out}
+
+    return {
+        "scale_percent": scale_percent,
+        "fabrics": fabrics_out,
+    }
 
 
 def select_faces_interactive(page, faces_per_piece, assembled=None):
@@ -3307,6 +3338,382 @@ def attach_lines_to_selection(selected, lines, tol=20.0):
                 pieces[best_i]["lines"].append(record(obj))
     return selected
 
+def _reflect_point_across_line(px, py, x1, y1, x2, y2):
+    """Reflect point (px, py) across the infinite line through (x1,y1)-(x2,y2)."""
+    dx, dy = x2 - x1, y2 - y1
+    length2 = dx * dx + dy * dy
+    if length2 < 1e-18:
+        return px, py
+    t = ((px - x1) * dx + (py - y1) * dy) / length2
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return 2.0 * proj_x - px, 2.0 * proj_y - py
+
+
+def _mirror_polygon_across_edge(poly, x1, y1, x2, y2):
+    from shapely.geometry import Polygon
+    coords = list(poly.exterior.coords)
+    mirrored = [
+        _reflect_point_across_line(x, y, x1, y1, x2, y2)
+        for x, y in coords
+    ]
+    mp = Polygon(mirrored)
+    if not mp.is_valid:
+        mp = mp.buffer(0)
+    return mp
+
+
+def _nearest_parallel_edge(poly, shaft_a, shaft_b, parallel_dot_min=0.92, max_dist=None):
+    """
+    Build one mirror line for the whole fold side:
+    all outer edges parallel + close to the fold shaft, then the line
+    through the two farthest endpoints of those edges.
+    Returns (x1,y1,x2,y2) or None.
+    """
+    import math
+    from shapely.geometry import LineString, Point
+
+    sx = shaft_b[0] - shaft_a[0]
+    sy = shaft_b[1] - shaft_a[1]
+    sl = math.hypot(sx, sy) or 1.0
+    sux, suy = sx / sl, sy / sl
+    mid = Point(
+        0.5 * (shaft_a[0] + shaft_b[0]),
+        0.5 * (shaft_a[1] + shaft_b[1]),
+    )
+
+    minx, miny, maxx, maxy = poly.bounds
+    if max_dist is None:
+        max_dist = 0.08 * max(maxx - minx, maxy - miny, 1.0)
+
+    coords = list(poly.exterior.coords)
+    pts = []
+    for i in range(len(coords) - 1):
+        x1, y1 = coords[i]
+        x2, y2 = coords[i + 1]
+        ex, ey = x2 - x1, y2 - y1
+        el = math.hypot(ex, ey)
+        if el < 1e-9:
+            continue
+        eux, euy = ex / el, ey / el
+        if abs(eux * sux + euy * suy) < parallel_dot_min:
+            continue
+        d = LineString([(x1, y1), (x2, y2)]).distance(mid)
+        if d > max_dist:
+            continue
+        pts.append((x1, y1))
+        pts.append((x2, y2))
+
+    if len(pts) < 2:
+        return None
+
+    # Line = segment between the two farthest fold-edge points
+    best_i, best_j = 0, 1
+    best_d = -1.0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d = math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1])
+            if d > best_d:
+                best_d = d
+                best_i, best_j = i, j
+    if best_d < 1e-9:
+        return None
+    return (pts[best_i][0], pts[best_i][1], pts[best_j][0], pts[best_j][1])
+
+
+def _orientation_record_from_fold(fold):
+    """Same fields as a grain line; used when the piece has fold but no grain."""
+    import math
+    eps = fold.get("endpoints") or []
+    if len(eps) < 2:
+        return None
+    a, b = eps[0], eps[1]
+    dx = float(b[0] - a[0])
+    dy = float(b[1] - a[1])
+    length = math.hypot(dx, dy) or 1.0
+    if dx < 0 or (abs(dx) < 1e-9 and dy < 0):
+        dx, dy = -dx, -dy
+    return {
+        "type": "grain",
+        "derived_from": "fold",
+        "endpoints": [[float(a[0]), float(a[1])], [float(b[0]), float(b[1])]],
+        "direction": [dx / length, dy / length],
+        "angle_deg": math.degrees(math.atan2(dy, dx)) % 180.0,
+        "length": float(fold.get("length") or length),
+    }
+
+def expand_folds_in_selection(selected, parallel_dot_min=0.92):
+    """
+    For every piece with fold line(s), mirror across the nearest parallel
+    outline edge and union. Updates points/segments/area/bbox in place.
+
+    Orientation lines left on the piece:
+      - grain present  → keep grain only
+      - fold only      → store fold shaft as grain substitute (derived_from=fold)
+    """
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    for fab in selected.get("fabrics", []):
+        for p in fab.get("pieces") or []:
+            folds = [ln for ln in (p.get("lines") or []) if ln.get("type") == "fold"]
+            grains = [ln for ln in (p.get("lines") or []) if ln.get("type") == "grain"]
+            pts = p.get("points") or []
+
+            if folds and len(pts) >= 3:
+                poly = Polygon([(float(x), float(y)) for x, y in pts])
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+
+                for fold in folds:
+                    eps = fold.get("endpoints") or []
+                    if len(eps) < 2:
+                        continue
+                    edge = _nearest_parallel_edge(
+                        poly, eps[0], eps[1], parallel_dot_min=parallel_dot_min,
+                    )
+                    if edge is None:
+                        continue
+                    x1, y1, x2, y2 = edge
+                    mirrored = _mirror_polygon_across_edge(poly, x1, y1, x2, y2)
+                    poly = unary_union([poly, mirrored])
+                    poly = poly.buffer(0.05).buffer(-0.05)
+                    if poly.geom_type == "MultiPolygon":
+                        poly = max(poly.geoms, key=lambda g: g.area)
+                    if not poly.is_valid:
+                        poly = poly.buffer(0)
+
+                if not poly.is_empty:
+                    if poly.geom_type == "MultiPolygon":
+                        poly = max(poly.geoms, key=lambda g: g.area)
+                    poly = poly.buffer(0)
+                    if poly.geom_type == "MultiPolygon":
+                        poly = max(poly.geoms, key=lambda g: g.area)
+                    if poly.geom_type == "Polygon":
+                        coords = list(poly.exterior.coords)
+                        p["points"] = [(float(x), float(y)) for x, y in coords[:-1]]
+                        p["segments"] = [
+                            (coords[i], coords[i + 1]) for i in range(len(coords) - 1)
+                        ]
+                        p["area"] = float(poly.area)
+                        p["perimeter"] = float(poly.length)
+                        p["bbox"] = tuple(float(v) for v in poly.bounds)
+                        p["folded"] = True
+
+            # Orientation for JSON / placement
+            if grains:
+                p["lines"] = grains
+            elif folds:
+                orient = []
+                for fold in folds:
+                    rec = _orientation_record_from_fold(fold)
+                    if rec is not None:
+                        orient.append(rec)
+                p["lines"] = orient
+            # else: leave lines as they were (usually empty)
+
+    return selected
+
+
+def preview_final_pieces(selected):
+    """
+    Show final cut outlines (after folds) with piece index and copy count.
+    Pieces are laid out side-by-side so they do not overlap in the preview.
+    Returns True if the user continues, False if they cancel.
+    """
+    import sys
+    from PySide6.QtCore import Qt, QPointF
+    from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
+    from PySide6.QtWidgets import (
+        QApplication, QDialog, QFrame, QGraphicsPolygonItem, QGraphicsScene,
+        QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+    )
+    from shapely.geometry import Polygon
+    from shapely.affinity import translate
+
+    fabrics = selected.get("fabrics", [])
+    if not fabrics:
+        return True
+
+    class PreviewView(QGraphicsView):
+        def __init__(self, scene):
+            super().__init__(scene)
+            self.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self.setFrameShape(QFrame.Shape.NoFrame)
+            self.setBackgroundBrush(QColor("#f3f3f3"))
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            self._panning = False
+            self._pan_pos = None
+
+        def wheelEvent(self, event):
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            self.scale(factor, factor)
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._panning = True
+                self._pan_pos = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event):
+            if self._panning and self._pan_pos is not None:
+                d = event.pos() - self._pan_pos
+                self._pan_pos = event.pos()
+                self.horizontalScrollBar().setValue(
+                    self.horizontalScrollBar().value() - d.x()
+                )
+                self.verticalScrollBar().setValue(
+                    self.verticalScrollBar().value() - d.y()
+                )
+                return
+            super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event):
+            if self._panning:
+                self._panning = False
+                self._pan_pos = None
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                event.accept()
+                return
+            super().mouseReleaseEvent(event)
+
+    class PreviewDialog(QDialog):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Final cut outlines (after folds)")
+            self.resize(1200, 850)
+
+            self.scene = QGraphicsScene(self)
+            self.view = PreviewView(self.scene)
+            self.badges = []
+
+            gap = 40.0
+            cursor_x = 0.0
+            row_y = 0.0
+            row_h = 0.0
+            max_row_w = 0.0
+            placed = []
+
+            idx = 0
+            for fab in fabrics:
+                for p in fab.get("pieces") or []:
+                    pts = p.get("points") or []
+                    if len(pts) < 3:
+                        continue
+                    poly = Polygon([(float(x), float(y)) for x, y in pts])
+                    if not poly.is_valid:
+                        poly = poly.buffer(0)
+                    if poly.is_empty:
+                        continue
+                    if poly.geom_type == "MultiPolygon":
+                        poly = max(poly.geoms, key=lambda g: g.area)
+                    if poly.geom_type != "Polygon":
+                        continue
+
+                    minx, miny, maxx, maxy = poly.bounds
+                    w = maxx - minx
+                    h = maxy - miny
+                    if cursor_x > 0 and cursor_x + w > 5000:
+                        row_y += row_h + gap
+                        cursor_x = 0.0
+                        row_h = 0.0
+
+                    dx = cursor_x - minx
+                    dy = row_y - miny
+                    moved = translate(poly, xoff=dx, yoff=dy)
+                    copies = int(p.get("copies") or 1)
+                    label = f"{fab['name']}: {idx}  ×{copies}"
+                    if p.get("folded"):
+                        label += "  fold"
+                    m = moved.bounds
+                    cx = 0.5 * (m[0] + m[2])
+                    cy = 0.5 * (m[1] + m[3])
+                    placed.append((moved, label, cx, cy))
+                    cursor_x += w + gap
+                    row_h = max(row_h, h)
+                    max_row_w = max(max_row_w, cursor_x)
+                    idx += 1
+
+            colour = QColor("#4c78a8")
+            colour.setAlpha(160)
+            for moved, label, cx, cy in placed:
+                pts = list(moved.exterior.coords)
+                item = QGraphicsPolygonItem(
+                    QPolygonF([QPointF(x, y) for x, y in pts])
+                )
+                item.setBrush(QBrush(colour))
+                pen = QPen(QColor(0, 0, 0))
+                pen.setCosmetic(True)
+                pen.setWidthF(2.0)
+                item.setPen(pen)
+                item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self.scene.addItem(item)
+
+                badge = QLabel(label, self.view.viewport())
+                badge.setStyleSheet(
+                    "background:#1f6feb; color:white; border-radius:8px; "
+                    "font-weight:700; font-size:12px; padding:3px 8px;"
+                )
+                badge.adjustSize()
+                self.badges.append((cx, cy, badge))
+
+            if placed:
+                self.scene.setSceneRect(
+                    -40, -40, max_row_w + 80, row_y + row_h + 80
+                )
+
+            cont = QPushButton("Continue to save")
+            cont.setObjectName("approve")
+            cancel = QPushButton("Cancel")
+            cont.clicked.connect(self.accept)
+            cancel.clicked.connect(self.reject)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(cancel)
+            row.addWidget(cont)
+
+            scale = selected.get("scale_percent", 100.0)
+            hint = QLabel(
+                f"Scale {scale:g}%. Final cut outlines after folds, laid out "
+                "side-by-side (not sheet positions). Numbers are piece index; "
+                "×N is copies. Drag to pan, wheel to zoom."
+            )
+            hint.setWordWrap(True)
+
+            lay = QVBoxLayout(self)
+            lay.addWidget(hint)
+            lay.addWidget(self.view, 1)
+            lay.addLayout(row)
+
+        def showEvent(self, event):
+            super().showEvent(event)
+            self.view.fitInView(
+                self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
+            )
+            self.place_badges()
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self.place_badges()
+
+        def place_badges(self):
+            for cx, cy, badge in self.badges:
+                pt = self.view.mapFromScene(QPointF(cx, cy))
+                badge.move(
+                    int(pt.x()) - badge.width() // 2,
+                    int(pt.y()) - badge.height() // 2,
+                )
+                badge.show()
+                badge.raise_()
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+    dlg = PreviewDialog()
+    return dlg.exec() == QDialog.Accepted
+
 def main():
     parser = argparse.ArgumentParser(
         description="Choose layers, assemble pages, then debug steps 1–5 + UI"
@@ -3459,12 +3866,14 @@ def main():
     print("Hover highlights a piece. Click selects it.")
     print("Click again toggles an inner face. Alt-click drops the piece.")
     print("Drag empty background to pan. Wheel to zoom.")
+    
     selected = select_faces_pyside6(
         faces_per_piece,
         lines,
         assembled=assembled_pat,
     )
 
+    print(f"Scale: {selected.get('scale_percent', 100)}%")
     fabrics = selected.get("fabrics", [])
     print(f"Fabrics: {len(fabrics)}")
     for fab in fabrics:
@@ -3480,7 +3889,15 @@ def main():
             )
 
     attach_lines_to_selection(selected, lines, tol=20.0)
-    
+    expand_folds_in_selection(selected)
+
+    print("\n=== Final cut outlines (after folds) ===")
+    if not preview_final_pieces(selected):
+        print("Preview cancelled – nothing written.")
+        pattern_doc.close()
+        instr_doc.close()
+        return
+
     step_write_selected(selected, out_dir, stem)
     
     pattern_doc.close()
