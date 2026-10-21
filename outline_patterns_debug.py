@@ -298,6 +298,34 @@ def assemble_pages(pattern_doc, pattern_pages,
     }
 
 # Helpers
+
+def label_point_inside(poly, tolerance=0.5):
+    """
+    Point suitable for a label: inside the polygon, near the visual center.
+    poly: Shapely Polygon (any units).
+    Returns (x, y).
+    """
+    from shapely.geometry import Polygon
+
+    if poly is None or poly.is_empty:
+        return (0.0, 0.0)
+    if poly.geom_type == "MultiPolygon":
+        poly = max(poly.geoms, key=lambda g: g.area)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty or poly.geom_type != "Polygon":
+        c = poly.centroid
+        return (float(c.x), float(c.y))
+
+    try:
+        from shapely.ops import polylabel
+        # tolerance in the same units as poly (cm in place_patterns, PDF units in debug)
+        pt = polylabel(poly, tolerance=tolerance)
+        return (float(pt.x), float(pt.y))
+    except Exception:
+        pt = poly.representative_point()
+        return (float(pt.x), float(pt.y))
+
 def dist(a, b):
     """Euclidean distance between two (x, y) points."""
     return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -1989,6 +2017,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         QVBoxLayout, QWidget,
     )
     from shapely.ops import unary_union
+    from shapely.geometry import Polygon
 
     lines = lines or []
     pieces = {pi: fl for pi, fl in faces_per_piece}
@@ -2545,8 +2574,8 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                     self.scene.addItem(item)
                     self.polys.append(item)
 
-                    cx = sum(x for x, y in pts) / len(pts)
-                    cy = sum(y for x, y in pts) / len(pts)
+                    poly = Polygon([(float(x), float(y)) for x, y in pts])
+                    cx, cy = label_point_inside(poly, tolerance=5.0)  # PDF units
                     badge = QLabel(str(i), self.view.viewport())
                     badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
                     badge.setFixedSize(28, 28)
@@ -3536,8 +3565,9 @@ def preview_final_pieces(selected):
         return True
 
     class PreviewView(QGraphicsView):
-        def __init__(self, scene):
+        def __init__(self, scene, on_view_changed=None):
             super().__init__(scene)
+            self.on_view_changed = on_view_changed
             self.setRenderHint(QPainter.RenderHint.Antialiasing)
             self.setFrameShape(QFrame.Shape.NoFrame)
             self.setBackgroundBrush(QColor("#f3f3f3"))
@@ -3545,9 +3575,18 @@ def preview_final_pieces(selected):
             self._panning = False
             self._pan_pos = None
 
+        def _notify(self):
+            if self.on_view_changed is not None:
+                self.on_view_changed()
+
         def wheelEvent(self, event):
             factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
             self.scale(factor, factor)
+            self._notify()
+
+        def scrollContentsBy(self, dx, dy):
+            super().scrollContentsBy(dx, dy)
+            self._notify()
 
         def mousePressEvent(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
@@ -3568,6 +3607,7 @@ def preview_final_pieces(selected):
                 self.verticalScrollBar().setValue(
                     self.verticalScrollBar().value() - d.y()
                 )
+                # scrollContentsBy already calls _notify
                 return
             super().mouseMoveEvent(event)
 
@@ -3587,7 +3627,7 @@ def preview_final_pieces(selected):
             self.resize(1200, 850)
 
             self.scene = QGraphicsScene(self)
-            self.view = PreviewView(self.scene)
+            self.view = PreviewView(self.scene, on_view_changed=self.place_badges)
             self.badges = []
 
             gap = 40.0
@@ -3628,9 +3668,7 @@ def preview_final_pieces(selected):
                     label = f"{fab['name']}: {idx}  ×{copies}"
                     if p.get("folded"):
                         label += "  fold"
-                    m = moved.bounds
-                    cx = 0.5 * (m[0] + m[2])
-                    cy = 0.5 * (m[1] + m[3])
+                    cx, cy = label_point_inside(moved, tolerance=5.0)
                     placed.append((moved, label, cx, cy))
                     cursor_x += w + gap
                     row_h = max(row_h, h)
