@@ -30,6 +30,36 @@ from matplotlib.patches import Polygon as MplPolygon
 from shapely.affinity import rotate, scale as shp_scale, translate
 from shapely.geometry import Polygon
 
+# ------------------------------------------------------------------
+# General helpers
+# ------------------------------------------------------------------
+
+def label_point_inside(poly, tolerance=0.5):
+    """
+    Point suitable for a label: inside the polygon, near the visual center.
+    poly: Shapely Polygon (any units).
+    Returns (x, y).
+    """
+    from shapely.geometry import Polygon
+
+    if poly is None or poly.is_empty:
+        return (0.0, 0.0)
+    if poly.geom_type == "MultiPolygon":
+        poly = max(poly.geoms, key=lambda g: g.area)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty or poly.geom_type != "Polygon":
+        c = poly.centroid
+        return (float(c.x), float(c.y))
+
+    try:
+        from shapely.ops import polylabel
+        # tolerance in the same units as poly (cm in place_patterns, PDF units in debug)
+        pt = polylabel(poly, tolerance=tolerance)
+        return (float(pt.x), float(pt.y))
+    except Exception:
+        pt = poly.representative_point()
+        return (float(pt.x), float(pt.y))
 
 # ------------------------------------------------------------------
 # Units
@@ -314,21 +344,17 @@ def draw_layout(fabric_name: str, width_cm: float, length_cm: float,
         [[0, 0], [width_cm, 0], [width_cm, length_cm], [0, length_cm]],
         closed=True, fill=False, edgecolor="0.4", linewidth=1.2, linestyle="--",
     ))
-    try:
-        cmap = plt.colormaps["tab20"]
-    except (AttributeError, KeyError):
-        cmap = plt.cm.get_cmap("tab20")
-    for i, p in enumerate(placements):
+    fill = "#4c78a8"
+    for p in placements:
         pts = p["points_cm"]
         if len(pts) < 3:
             continue
-        color = cmap(i % 20)
         ax.add_patch(MplPolygon(
-            pts, closed=True, facecolor=color, edgecolor="black",
+            pts, closed=True, facecolor=fill, edgecolor="black",
             alpha=0.55, linewidth=0.8,
         ))
-        cx = sum(x for x, y in pts) / len(pts)
-        cy = sum(y for x, y in pts) / len(pts)
+        poly = Polygon(pts)
+        cx, cy = label_point_inside(poly, tolerance=0.5)
         ax.text(
             cx, cy,
             f"{p['piece_index']}:{p['copy_index']}",
