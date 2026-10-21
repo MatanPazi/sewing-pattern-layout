@@ -1662,35 +1662,107 @@ def _draw_noded_debug(noded_segments, bounds, out_path, snap_tol):
 
 
 def _draw_selected_debug(selected, out_path: Path, title="SELECTED – combined outlines"):
+    """
+    Draw final cut outlines side-by-side (not sheet coordinates),
+    so fold-expanded pieces do not overlap in the PNG.
+    """
     if not selected:
         return
-    xs0, ys0, xs1, ys1 = zip(*[p["bbox"] for p in selected])
-    x0, y0, x1, y1 = min(xs0), min(ys0), max(xs1), max(ys1)
-    w, h = max(x1 - x0, 1.0), max(y1 - y0, 1.0)
+
+    from shapely.geometry import Polygon
+    from shapely.affinity import translate
+
+    gap = 40.0
+    cursor_x = 0.0
+    row_y = 0.0
+    row_h = 0.0
+    max_row_w = 0.0
+    drawn = []  # (segments, label)
+
+    for i, p in enumerate(selected):
+        pts = p.get("points") or []
+        if len(pts) < 3:
+            segs = p.get("segments") or []
+            if not segs:
+                continue
+            # fallback: build ring from segments if points missing
+            try:
+                pts = [segs[0][0]] + [s[1] for s in segs]
+            except Exception:
+                continue
+
+        poly = Polygon([(float(x), float(y)) for x, y in pts])
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty:
+            continue
+        if poly.geom_type == "MultiPolygon":
+            poly = max(poly.geoms, key=lambda g: g.area)
+        if poly.geom_type != "Polygon":
+            continue
+
+        minx, miny, maxx, maxy = poly.bounds
+        w = maxx - minx
+        h = maxy - miny
+        if cursor_x > 0 and cursor_x + w > 5000:
+            row_y += row_h + gap
+            cursor_x = 0.0
+            row_h = 0.0
+
+        moved = translate(poly, xoff=cursor_x - minx, yoff=row_y - miny)
+        coords = list(moved.exterior.coords)
+        segs = [(coords[j], coords[j + 1]) for j in range(len(coords) - 1)]
+        copies = int(p.get("copies") or 1)
+        label = f"{i}  x{copies}"
+        if p.get("folded"):
+            label += "  fold"
+        cx, cy = label_point_inside(moved, tolerance=5.0)
+        drawn.append((segs, label, cx, cy))
+        cursor_x += w + gap
+        row_h = max(row_h, h)
+        max_row_w = max(max_row_w, cursor_x)
+
+    if not drawn:
+        return
+
+    x0, y0 = -20.0, -20.0
+    x1 = max_row_w + 20.0
+    y1 = row_y + row_h + 20.0
+    w = max(x1 - x0, 1.0)
+    h = max(y1 - y0, 1.0)
+
     fig, ax = plt.subplots(figsize=(14, max(6.0, 14 * h / w)))
-    ax.set_xlim(x0 - 20, x1 + 20)
-    ax.set_ylim(y1 + 20, y0 - 20)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y1, y0)  # PDF-style y-down
     ax.set_aspect("equal")
     ax.axis("off")
     ax.set_title(title, fontsize=11)
-    try:
-        cmap = mpl.colormaps["tab10"]
-    except (AttributeError, KeyError):
-        cmap = plt.cm.get_cmap("tab10")
-    for i, p in enumerate(selected):
-        segs = p.get("segments") or []
-        if segs:
-            ax.add_collection(LineCollection(
-                segs, colors=[cmap(i % 10)], linewidths=2.0, zorder=3
-            ))
+
+    fill = "#4c78a8"
+    for segs, label, cx, cy in drawn:
+        xs = [s[0][0] for s in segs] + [segs[0][0][0]]
+        ys = [s[0][1] for s in segs] + [segs[0][0][1]]
+        # close fill from exterior ring
+        ring = [segs[0][0]] + [s[1] for s in segs]
+        ax.fill(
+            [q[0] for q in ring],
+            [q[1] for q in ring],
+            facecolor=fill,
+            edgecolor="black",
+            alpha=0.55,
+            linewidth=1.2,
+            zorder=3,
+        )
+        ax.text(cx, cy, label, ha="center", va="center", fontsize=8, color="black", zorder=4)
+
     ax.text(
-        0.01, 0.99, f"pieces={len(selected)}",
+        0.01, 0.99, f"pieces={len(drawn)}",
         transform=ax.transAxes, fontsize=9, va="top",
         bbox=dict(facecolor="white", alpha=0.85, edgecolor="none", pad=3),
     )
     plt.tight_layout()
     plt.savefig(out_path, dpi=140, bbox_inches="tight")
-    plt.close()    
+    plt.close()
 
 # ------------------------------------------------------------------
 # INTERACTIVE FACE SELECTOR  (v2 – faster, per-piece colours, start selected)
@@ -3546,9 +3618,8 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
 
 def preview_final_pieces(selected):
     """
-    Show final cut outlines (after folds) with piece index and copy count.
-    Pieces are laid out side-by-side so they do not overlap in the preview.
-    Returns True if the user continues, False if they cancel.
+    Show final cut outlines (after folds), one fabric at a time.
+    Returns True if the user continues through all fabrics, False if cancel.
     """
     import sys
     from PySide6.QtCore import Qt, QPointF
@@ -3607,7 +3678,6 @@ def preview_final_pieces(selected):
                 self.verticalScrollBar().setValue(
                     self.verticalScrollBar().value() - d.y()
                 )
-                # scrollContentsBy already calls _notify
                 return
             super().mouseMoveEvent(event)
 
@@ -3621,9 +3691,12 @@ def preview_final_pieces(selected):
             super().mouseReleaseEvent(event)
 
     class PreviewDialog(QDialog):
-        def __init__(self):
+        def __init__(self, fab, fi, n_fabrics):
             super().__init__()
-            self.setWindowTitle("Final cut outlines (after folds)")
+            name = fab.get("name") or f"fabric_{fi}"
+            self.setWindowTitle(
+                f"Final cut outlines – {name}  ({fi + 1}/{n_fabrics})"
+            )
             self.resize(1200, 850)
 
             self.scene = QGraphicsScene(self)
@@ -3638,42 +3711,41 @@ def preview_final_pieces(selected):
             placed = []
 
             idx = 0
-            for fab in fabrics:
-                for p in fab.get("pieces") or []:
-                    pts = p.get("points") or []
-                    if len(pts) < 3:
-                        continue
-                    poly = Polygon([(float(x), float(y)) for x, y in pts])
-                    if not poly.is_valid:
-                        poly = poly.buffer(0)
-                    if poly.is_empty:
-                        continue
-                    if poly.geom_type == "MultiPolygon":
-                        poly = max(poly.geoms, key=lambda g: g.area)
-                    if poly.geom_type != "Polygon":
-                        continue
+            for p in fab.get("pieces") or []:
+                pts = p.get("points") or []
+                if len(pts) < 3:
+                    continue
+                poly = Polygon([(float(x), float(y)) for x, y in pts])
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if poly.is_empty:
+                    continue
+                if poly.geom_type == "MultiPolygon":
+                    poly = max(poly.geoms, key=lambda g: g.area)
+                if poly.geom_type != "Polygon":
+                    continue
 
-                    minx, miny, maxx, maxy = poly.bounds
-                    w = maxx - minx
-                    h = maxy - miny
-                    if cursor_x > 0 and cursor_x + w > 5000:
-                        row_y += row_h + gap
-                        cursor_x = 0.0
-                        row_h = 0.0
+                minx, miny, maxx, maxy = poly.bounds
+                w = maxx - minx
+                h = maxy - miny
+                if cursor_x > 0 and cursor_x + w > 5000:
+                    row_y += row_h + gap
+                    cursor_x = 0.0
+                    row_h = 0.0
 
-                    dx = cursor_x - minx
-                    dy = row_y - miny
-                    moved = translate(poly, xoff=dx, yoff=dy)
-                    copies = int(p.get("copies") or 1)
-                    label = f"{fab['name']}: {idx}  ×{copies}"
-                    if p.get("folded"):
-                        label += "  fold"
-                    cx, cy = label_point_inside(moved, tolerance=5.0)
-                    placed.append((moved, label, cx, cy))
-                    cursor_x += w + gap
-                    row_h = max(row_h, h)
-                    max_row_w = max(max_row_w, cursor_x)
-                    idx += 1
+                dx = cursor_x - minx
+                dy = row_y - miny
+                moved = translate(poly, xoff=dx, yoff=dy)
+                copies = int(p.get("copies") or 1)
+                label = f"{idx}  ×{copies}"
+                if p.get("folded"):
+                    label += "  fold"
+                cx, cy = label_point_inside(moved, tolerance=5.0)
+                placed.append((moved, label, cx, cy))
+                cursor_x += w + gap
+                row_h = max(row_h, h)
+                max_row_w = max(max_row_w, cursor_x)
+                idx += 1
 
             colour = QColor("#4c78a8")
             colour.setAlpha(160)
@@ -3703,7 +3775,10 @@ def preview_final_pieces(selected):
                     -40, -40, max_row_w + 80, row_y + row_h + 80
                 )
 
-            cont = QPushButton("Continue to save")
+            cont_text = (
+                "Continue" if fi + 1 < n_fabrics else "Continue to save"
+            )
+            cont = QPushButton(cont_text)
             cont.setObjectName("approve")
             cancel = QPushButton("Cancel")
             cont.clicked.connect(self.accept)
@@ -3715,9 +3790,9 @@ def preview_final_pieces(selected):
 
             scale = selected.get("scale_percent", 100.0)
             hint = QLabel(
-                f"Scale {scale:g}%. Final cut outlines after folds, laid out "
-                "side-by-side (not sheet positions). Numbers are piece index; "
-                "×N is copies. Drag to pan, wheel to zoom."
+                f"Fabric “{name}” ({fi + 1}/{n_fabrics}). "
+                f"Scale {scale:g}%. Final cut outlines after folds. "
+                "Drag to pan, wheel to zoom."
             )
             hint.setWordWrap(True)
 
@@ -3749,8 +3824,13 @@ def preview_final_pieces(selected):
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
-    dlg = PreviewDialog()
-    return dlg.exec() == QDialog.Accepted
+
+    n = len(fabrics)
+    for fi, fab in enumerate(fabrics):
+        dlg = PreviewDialog(fab, fi, n)
+        if dlg.exec() != QDialog.Accepted:
+            return False
+    return True
 
 def main():
     parser = argparse.ArgumentParser(
