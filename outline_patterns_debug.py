@@ -2474,7 +2474,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                 lay = QVBoxLayout(self)
                 lay.addWidget(QLabel("Pattern scale (100% = true size when the PDF is printed at 100%)"))
                 lay.addWidget(self.scale)                
-                lay.addWidget(QLabel("How many fabrics do you want to use?"))
+                lay.addWidget(QLabel("How many types of fabric do you want to use? [main, lining, etc.]"))
                 lay.addWidget(self.count)
                 lay.addWidget(scroll, 1)
                 lay.addLayout(row)
