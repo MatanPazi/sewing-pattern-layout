@@ -243,8 +243,12 @@ def place_fabric(
         reverse=True,
     )
 
-    for idx in order:
+    n = len(order)
+    print(f"  placing {n} instance(s)...", flush=True)
+
+    for k, idx in enumerate(order, start=1):
         inst = instances[idx]
+        print(f"\r  placing {k}/{n}", end="", flush=True)
         best = None  # (top_y, min_x, rotation, poly, buf)
 
         for rot in inst["rotations"]:
@@ -322,6 +326,8 @@ def place_fabric(
             "points_cm": [[float(x), float(y)] for x, y in coords[:-1]],
         })
 
+    print(flush=True)  # newline after \r progress
+    
     length = 0.0
     if placements:
         length = max(p["bbox_cm"][3] for p in placements)
