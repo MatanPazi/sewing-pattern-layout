@@ -1296,7 +1296,6 @@ def step_write_selected(selected, out_dir: Path, stem: str):
     summary_path = out_dir / f"{stem}_selected_summary.txt"
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("SELECTED – fabrics and combined outlines\n")
-        f.write(f"  scale_percent : {selected.get('scale_percent', 100)}\n")
         f.write(f"  fabrics : {len(fabrics)}\n\n")
         for fi, fab in enumerate(fabrics):
             pieces = fab.get("pieces") or []
@@ -1354,7 +1353,6 @@ def step_write_selected(selected, out_dir: Path, stem: str):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "scale_percent": selected.get("scale_percent", 100.0),
                 "fabrics": payload,
             },
             f,
@@ -2462,18 +2460,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                 row.addWidget(cancel)
                 row.addWidget(cont)
 
-                self.scale = QDoubleSpinBox()
-                self.scale.setRange(10.0, 400.0)
-                self.scale.setDecimals(1)
-                self.scale.setSingleStep(5.0)
-                self.scale.setValue(100.0)
-                self.scale.setSuffix(" %")
-
-
-
                 lay = QVBoxLayout(self)
-                lay.addWidget(QLabel("Pattern scale (100% = true size when the PDF is printed at 100%)"))
-                lay.addWidget(self.scale)                
                 lay.addWidget(QLabel("How many types of fabric do you want to use? [main, lining, etc.]"))
                 lay.addWidget(self.count)
                 lay.addWidget(scroll, 1)
@@ -2528,7 +2515,6 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                         "width": float(width.value()),
                         "directional": bool(direc.isChecked()),
                     })
-                self.scale_percent = float(self.scale.value())
                 self.specs = specs
                 self.accept()
 
@@ -2536,7 +2522,6 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         if dlg.exec() != QDialog.Accepted:
             return None
         return {
-            "scale_percent": float(dlg.scale_percent),
             "fabric_specs": dlg.specs,
         }
 
@@ -2728,9 +2713,8 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
 
     setup = ask_fabrics()
     if not setup:
-        return {"scale_percent": 100.0, "fabrics": []}
+        return {"fabrics": []}
 
-    scale_percent = setup["scale_percent"]
     specs = setup["fabric_specs"]
 
     fabrics_out = []
@@ -2746,14 +2730,14 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         while True:
             dlg = Picker(subtitle, remembered_active, remembered_off)
             if dlg.exec() != QDialog.Accepted:
-                return {"scale_percent": scale_percent, "fabrics": []}
+                return {"fabrics": []}
             remembered_active = set(dlg.active)
             remembered_off = set(dlg.off)
             choice = ask_copies(spec, dlg.output, remembered_copies)
             if choice is None:
                 continue
             if choice == "cancel":
-                return {"scale_percent": scale_percent, "fabrics": []}
+                return {"fabrics": []}
             for p, n in zip(dlg.output, choice):
                 p["copies"] = n
                 remembered_copies[p.get("source_piece")] = n
@@ -2767,7 +2751,6 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
             break
 
     return {
-        "scale_percent": scale_percent,
         "fabrics": fabrics_out,
     }
 
@@ -3788,10 +3771,8 @@ def preview_final_pieces(selected):
             row.addWidget(cancel)
             row.addWidget(cont)
 
-            scale = selected.get("scale_percent", 100.0)
             hint = QLabel(
                 f"Fabric “{name}” ({fi + 1}/{n_fabrics}). "
-                f"Scale {scale:g}%. Final cut outlines after folds. "
                 "Drag to pan, wheel to zoom."
             )
             hint.setWordWrap(True)
@@ -3991,7 +3972,6 @@ def main():
         assembled=assembled_pat,
     )
 
-    print(f"Scale: {selected.get('scale_percent', 100)}%")
     fabrics = selected.get("fabrics", [])
     print(f"Fabrics: {len(fabrics)}")
     for fab in fabrics:
@@ -4028,8 +4008,6 @@ if __name__ == "__main__":
 
 
 # TODO
-# Remove scaling. Relevant only for printing, not in this case.
-# Change title: "How many types of fabric do you want to use? [main, lining, etc.]"
 # There are chamfers everywhere! fix.
 # Add some kind of fold indicator when showing pattern outlines after fold, some dashed line.
 # When choosing 2 fabrics, there was supposed to be folded patterns on the 2nd fabric but it wasn't folded! fix
