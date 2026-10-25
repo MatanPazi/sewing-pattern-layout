@@ -4028,3 +4028,11 @@ if __name__ == "__main__":
 
 
 # TODO
+# Remove scaling. Relevant only for printing, not in this case.
+# Change title: "How many types of fabric do you want to use? [main, lining, etc.]"
+# There are chamfers everywhere! fix.
+# Add some kind of fold indicator when showing pattern outlines after fold, some dashed line.
+# When choosing 2 fabrics, there was supposed to be folded patterns on the 2nd fabric but it wasn't folded! fix
+# All piece and copy # should start from 1 not 0
+# if any of the pieces had 2 or more grain lines detected, add a new step/window that requests the user to choose the correct grainline.
+
