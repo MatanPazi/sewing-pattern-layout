@@ -4035,4 +4035,4 @@ if __name__ == "__main__":
 # When choosing 2 fabrics, there was supposed to be folded patterns on the 2nd fabric but it wasn't folded! fix
 # All piece and copy # should start from 1 not 0
 # if any of the pieces had 2 or more grain lines detected, add a new step/window that requests the user to choose the correct grainline.
-
+# PS_Lulu pattern - got 2 seperate outlines instead of merging them together. Fix
