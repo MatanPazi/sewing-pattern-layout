@@ -28,7 +28,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
 from shapely.affinity import rotate, scale as shp_scale, translate
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, LineString
 
 # ------------------------------------------------------------------
 # General helpers
@@ -40,7 +40,6 @@ def label_point_inside(poly, tolerance=0.5):
     poly: Shapely Polygon (any units).
     Returns (x, y).
     """
-    from shapely.geometry import Polygon
 
     if poly is None or poly.is_empty:
         return (0.0, 0.0)
@@ -65,9 +64,9 @@ def label_point_inside(poly, tolerance=0.5):
 # Units
 # ------------------------------------------------------------------
 
-def pdf_units_per_cm(scale_percent: float) -> float:
-    """PDF points per centimetre at the given print scale (100% = true size)."""
-    return (72.0 / 2.54) * (float(scale_percent) / 100.0)
+def pdf_units_per_cm() -> float:
+    """PDF points per centimetre at true size (100% print scale)."""
+    return 72.0 / 2.54
 
 
 def poly_from_points(points) -> Polygon | None:
@@ -163,6 +162,18 @@ def build_instances(fabric: dict, units_per_cm: float) -> list[dict]:
         g_angle = grain_angle_deg(piece)
         has_grain = g_angle is not None
         base = orient_grain_to_length(poly_cm, g_angle)
+        base_axes = []
+        for ax in (piece.get("fold_axes") or []):
+            if len(ax) < 4:
+                continue
+            line = LineString([(float(ax[0]), float(ax[1])),
+                               (float(ax[2]), float(ax[3]))])
+            line = shp_scale(line, 1.0 / units_per_cm, 1.0 / units_per_cm, origin=(0, 0))
+            if g_angle is not None:
+                delta = 90.0 - float(g_angle)
+                line = rotate(line, delta, origin=poly_cm.centroid, use_radians=False)
+            coords = list(line.coords)
+            base_axes.append([coords[0][0], coords[0][1], coords[1][0], coords[1][1]])        
         rots = allowed_rotations(has_grain, directional)
         n_copies = max(1, int(piece.get("copies") or 1))
 
@@ -179,6 +190,7 @@ def build_instances(fabric: dict, units_per_cm: float) -> list[dict]:
                 "has_grain": has_grain,
                 "grain_angle_deg": g_angle,
                 "folded": bool(piece.get("folded")),
+                "base_fold_axes": base_axes,
             })
     return instances
 
@@ -313,6 +325,28 @@ def place_fabric(
         top, left, rot, trial_poly, trial_buf = best
         placed_buffers.append(trial_buf)
         coords = list(trial_poly.exterior.coords)
+
+        # Pose fold axes the same way as the polygon
+        posed = apply_pose(inst["base_poly"], rot, inst["mirrored"])
+        dx = float(trial_poly.centroid.x - posed.centroid.x)
+        dy = float(trial_poly.centroid.y - posed.centroid.y)
+
+        fold_axes_cm = []
+        for ax_seg in inst.get("base_fold_axes") or []:
+            if len(ax_seg) < 4:
+                continue
+            line = LineString([(ax_seg[0], ax_seg[1]), (ax_seg[2], ax_seg[3])])
+            if inst["mirrored"]:
+                line = mirror_across_y(line)
+            if abs(rot) > 1e-9:
+                pre = inst["base_poly"]
+                if inst["mirrored"]:
+                    pre = mirror_across_y(pre)
+                line = rotate(line, rot, origin=pre.centroid, use_radians=False)
+            line = translate(line, xoff=dx, yoff=dy)
+            c = list(line.coords)
+            fold_axes_cm.append([c[0][0], c[0][1], c[1][0], c[1][1]])
+
         placements.append({
             "piece_index": inst["piece_index"],
             "copy_index": inst["copy_index"],
@@ -322,12 +356,13 @@ def place_fabric(
             "has_grain": inst["has_grain"],
             "grain_angle_deg": inst["grain_angle_deg"],
             "folded": inst["folded"],
+            "fold_axes_cm": fold_axes_cm,
             "bbox_cm": [float(v) for v in trial_poly.bounds],
             "points_cm": [[float(x), float(y)] for x, y in coords[:-1]],
         })
 
     print(flush=True)  # newline after \r progress
-    
+
     length = 0.0
     if placements:
         length = max(p["bbox_cm"][3] for p in placements)
@@ -355,6 +390,12 @@ def draw_layout(fabric_name: str, width_cm: float, length_cm: float,
         pts = p["points_cm"]
         if len(pts) < 3:
             continue
+        for ax_seg in p.get("fold_axes_cm") or []:
+            if len(ax_seg) >= 4:
+                ax.plot(
+                    [ax_seg[0], ax_seg[2]], [ax_seg[1], ax_seg[3]],
+                    color="#9b59b6", linestyle="--", linewidth=1.5, zorder=5,
+                )        
         ax.add_patch(MplPolygon(
             pts, closed=True, facecolor=fill, edgecolor="black",
             alpha=0.55, linewidth=0.8,
@@ -386,12 +427,10 @@ def place_from_json(
     gap_cm: float = 1.0,
     grid_cm: float = 0.5,
 ) -> dict:
-    scale = float(data.get("scale_percent") or 100.0)
-    upc = pdf_units_per_cm(scale)
-    print(f"Scale {scale:g}%  →  {upc:.4f} PDF units / cm")
+    upc = pdf_units_per_cm()
+    print(f"Using {upc:.4f} PDF units / cm")
 
     result = {
-        "scale_percent": scale,
         "gap_cm": gap_cm,
         "grid_cm": grid_cm,
         "fabrics": [],
