@@ -1336,6 +1336,7 @@ def step_write_selected(selected, out_dir: Path, stem: str):
                 "copies": int(p.get("copies") or 1),
                 "lines": p.get("lines") or [],
                 "folded": bool(p.get("folded")),
+                "fold_axes": p.get("fold_axes") or [],
                 "area": p.get("area"),
                 "perimeter": p.get("perimeter"),
                 "bbox": [float(x) for x in (p.get("bbox") or ())],
@@ -1715,7 +1716,18 @@ def _draw_selected_debug(selected, out_path: Path, title="SELECTED – combined 
         if p.get("folded"):
             label += "  fold"
         cx, cy = label_point_inside(moved, tolerance=5.0)
-        drawn.append((segs, label, cx, cy))
+
+        dx = cursor_x - minx
+        dy = row_y - miny
+        axes = []
+        for ax in (p.get("fold_axes") or []):
+            if len(ax) >= 4:
+                axes.append([
+                    float(ax[0]) + dx, float(ax[1]) + dy,
+                    float(ax[2]) + dx, float(ax[3]) + dy,
+                ])
+
+        drawn.append((segs, label, cx, cy, axes))
         cursor_x += w + gap
         row_h = max(row_h, h)
         max_row_w = max(max_row_w, cursor_x)
@@ -1737,10 +1749,7 @@ def _draw_selected_debug(selected, out_path: Path, title="SELECTED – combined 
     ax.set_title(title, fontsize=11)
 
     fill = "#4c78a8"
-    for segs, label, cx, cy in drawn:
-        xs = [s[0][0] for s in segs] + [segs[0][0][0]]
-        ys = [s[0][1] for s in segs] + [segs[0][0][1]]
-        # close fill from exterior ring
+    for segs, label, cx, cy, axes in drawn:
         ring = [segs[0][0]] + [s[1] for s in segs]
         ax.fill(
             [q[0] for q in ring],
@@ -1751,7 +1760,15 @@ def _draw_selected_debug(selected, out_path: Path, title="SELECTED – combined 
             linewidth=1.2,
             zorder=3,
         )
-        ax.text(cx, cy, label, ha="center", va="center", fontsize=8, color="black", zorder=4)
+        for x1, y1, x2, y2 in axes:
+            ax.plot(
+                [x1, x2], [y1, y2],
+                color="#9b59b6",
+                linestyle="--",
+                linewidth=1.5,
+                zorder=4,
+            )
+        ax.text(cx, cy, label, ha="center", va="center", fontsize=8, color="black", zorder=5)
 
     ax.text(
         0.01, 0.99, f"pieces={len(drawn)}",
@@ -3534,6 +3551,8 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
     Orientation lines left on the piece:
       - grain present  → keep grain only
       - fold only      → store fold shaft as grain substitute (derived_from=fold)
+
+    Also stores fold_axes: list of [x1,y1,x2,y2] mirror lines used (for display).
     """
     from shapely.geometry import Polygon
     from shapely.ops import unary_union
@@ -3543,6 +3562,7 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
             folds = [ln for ln in (p.get("lines") or []) if ln.get("type") == "fold"]
             grains = [ln for ln in (p.get("lines") or []) if ln.get("type") == "grain"]
             pts = p.get("points") or []
+            fold_axes = []
 
             if folds and len(pts) >= 3:
                 poly = Polygon([(float(x), float(y)) for x, y in pts])
@@ -3559,6 +3579,7 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
                     if edge is None:
                         continue
                     x1, y1, x2, y2 = edge
+                    fold_axes.append([float(x1), float(y1), float(x2), float(y2)])
                     mirrored = _mirror_polygon_across_edge(poly, x1, y1, x2, y2)
                     poly = unary_union([poly, mirrored])
                     poly = poly.buffer(0.05).buffer(-0.05)
@@ -3583,6 +3604,7 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
                         p["perimeter"] = float(poly.length)
                         p["bbox"] = tuple(float(v) for v in poly.bounds)
                         p["folded"] = True
+                        p["fold_axes"] = fold_axes
 
             # Orientation for JSON / placement
             if grains:
@@ -3608,8 +3630,8 @@ def preview_final_pieces(selected):
     from PySide6.QtCore import Qt, QPointF
     from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
     from PySide6.QtWidgets import (
-        QApplication, QDialog, QFrame, QGraphicsPolygonItem, QGraphicsScene,
-        QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+        QApplication, QDialog, QFrame, QGraphicsPolygonItem, QGraphicsLineItem,
+        QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
     )
     from shapely.geometry import Polygon
     from shapely.affinity import translate
@@ -3724,7 +3746,17 @@ def preview_final_pieces(selected):
                 if p.get("folded"):
                     label += "  fold"
                 cx, cy = label_point_inside(moved, tolerance=5.0)
-                placed.append((moved, label, cx, cy))
+
+                # Translate fold axes into the same layout space
+                axes = []
+                for ax in (p.get("fold_axes") or []):
+                    if len(ax) >= 4:
+                        axes.append([
+                            float(ax[0]) + dx, float(ax[1]) + dy,
+                            float(ax[2]) + dx, float(ax[3]) + dy,
+                        ])
+
+                placed.append((moved, label, cx, cy, axes))
                 cursor_x += w + gap
                 row_h = max(row_h, h)
                 max_row_w = max(max_row_w, cursor_x)
@@ -3732,7 +3764,7 @@ def preview_final_pieces(selected):
 
             colour = QColor("#4c78a8")
             colour.setAlpha(160)
-            for moved, label, cx, cy in placed:
+            for moved, label, cx, cy, axes in placed:
                 pts = list(moved.exterior.coords)
                 item = QGraphicsPolygonItem(
                     QPolygonF([QPointF(x, y) for x, y in pts])
@@ -3744,6 +3776,18 @@ def preview_final_pieces(selected):
                 item.setPen(pen)
                 item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                 self.scene.addItem(item)
+
+                # Dashed fold axis
+                if axes:
+                    fold_pen = QPen(QColor("#9b59b6"))  # purple, same family as fold marks
+                    fold_pen.setCosmetic(True)
+                    fold_pen.setWidthF(2.0)
+                    fold_pen.setStyle(Qt.PenStyle.DashLine)
+                    for x1, y1, x2, y2 in axes:
+                        line = QGraphicsLineItem(x1, y1, x2, y2)
+                        line.setPen(fold_pen)
+                        line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                        self.scene.addItem(line)
 
                 badge = QLabel(label, self.view.viewport())
                 badge.setStyleSheet(
@@ -3773,6 +3817,7 @@ def preview_final_pieces(selected):
 
             hint = QLabel(
                 f"Fabric “{name}” ({fi + 1}/{n_fabrics}). "
+                "Dashed purple line = fold axis. "
                 "Drag to pan, wheel to zoom."
             )
             hint.setWordWrap(True)
