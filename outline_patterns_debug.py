@@ -3485,7 +3485,7 @@ def _nearest_parallel_edge(poly, shaft_a, shaft_b, parallel_dot_min=0.92, max_di
 
     minx, miny, maxx, maxy = poly.bounds
     if max_dist is None:
-        max_dist = 0.08 * max(maxx - minx, maxy - miny, 1.0)
+        max_dist = 0.15 * max(maxx - minx, maxy - miny, 1.0)
 
     coords = list(poly.exterior.coords)
     pts = []
@@ -3577,7 +3577,9 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
                         poly, eps[0], eps[1], parallel_dot_min=parallel_dot_min,
                     )
                     if edge is None:
-                        continue
+                        # Fallback: mirror across the fold shaft itself
+                        a, b = eps[0], eps[1]
+                        edge = (float(a[0]), float(a[1]), float(b[0]), float(b[1]))
                     x1, y1, x2, y2 = edge
                     fold_axes.append([float(x1), float(y1), float(x2), float(y2)])
                     mirrored = _mirror_polygon_across_edge(poly, x1, y1, x2, y2)
@@ -3594,7 +3596,7 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
                     poly = poly.buffer(0)
                     if poly.geom_type == "MultiPolygon":
                         poly = max(poly.geoms, key=lambda g: g.area)
-                    if poly.geom_type == "Polygon":
+                    if poly.geom_type == "Polygon" and fold_axes:
                         coords = list(poly.exterior.coords)
                         p["points"] = [(float(x), float(y)) for x, y in coords[:-1]]
                         p["segments"] = [
@@ -4054,7 +4056,6 @@ if __name__ == "__main__":
 
 # TODO
 # There are chamfers everywhere! fix.
-# When choosing 2 fabrics, there was supposed to be folded patterns on the 2nd fabric but it wasn't folded! fix
 # All piece and copy # should start from 1 not 0
 # if any of the pieces had 2 or more grain lines detected, add a new step/window that requests the user to choose the correct grainline.
 # PS_Lulu pattern - got 2 seperate outlines instead of merging them together. Fix
