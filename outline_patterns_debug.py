@@ -1307,7 +1307,7 @@ def step_write_selected(selected, out_dir: Path, stem: str):
             f.write(f"  pieces : {len(pieces)}\n")
             for i, p in enumerate(pieces):
                 f.write(
-                    f"  [{i}] copies={p.get('copies', 1)}  area={p.get('area', 0):.0f}  "
+                    f"  [{i + 1}] copies={p.get('copies', 1)}  area={p.get('area', 0):.0f}  "
                     f"peri={p.get('perimeter', 0):.1f}  "
                     f"faces={p.get('selected_faces')}  pts={len(p.get('points') or [])}  "
                     f"bbox={p.get('bbox')}\n"
@@ -1712,7 +1712,7 @@ def _draw_selected_debug(selected, out_path: Path, title="SELECTED – combined 
         coords = list(moved.exterior.coords)
         segs = [(coords[j], coords[j + 1]) for j in range(len(coords) - 1)]
         copies = int(p.get("copies") or 1)
-        label = f"{i}  x{copies}"
+        label = f"{i + 1}  x{copies}"
         if p.get("folded"):
             label += "  fold"
         cx, cy = label_point_inside(moved, tolerance=5.0)
@@ -2650,7 +2650,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
 
                     poly = Polygon([(float(x), float(y)) for x, y in pts])
                     cx, cy = label_point_inside(poly, tolerance=5.0)  # PDF units
-                    badge = QLabel(str(i), self.view.viewport())
+                    badge = QLabel(str(i + 1), self.view.viewport())
                     badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
                     badge.setFixedSize(28, 28)
                     badge.setStyleSheet(
@@ -3744,7 +3744,7 @@ def preview_final_pieces(selected):
                 dy = row_y - miny
                 moved = translate(poly, xoff=dx, yoff=dy)
                 copies = int(p.get("copies") or 1)
-                label = f"{idx}  ×{copies}"
+                label = f"{idx + 1}  ×{copies}"
                 if p.get("folded"):
                     label += "  fold"
                 cx, cy = label_point_inside(moved, tolerance=5.0)
@@ -4056,6 +4056,5 @@ if __name__ == "__main__":
 
 # TODO
 # There are chamfers everywhere! fix.
-# All piece and copy # should start from 1 not 0
 # if any of the pieces had 2 or more grain lines detected, add a new step/window that requests the user to choose the correct grainline.
 # PS_Lulu pattern - got 2 seperate outlines instead of merging them together. Fix
