@@ -3870,7 +3870,7 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--min-seg-length", type=float, default=2.0)
     parser.add_argument("--max-extension", type=float, default=15.0)
-    parser.add_argument("--join-radius", type=float, default=10.0)
+    parser.add_argument("--join-radius", type=float, default=7.0)
     parser.add_argument("--path-snap-radius", type=float, default=2.0)
     parser.add_argument("--snap-tol", type=float, default=0.1)
     parser.add_argument("--min-face-area", type=float, default=400.0)
@@ -4055,6 +4055,5 @@ if __name__ == "__main__":
 
 
 # TODO
-# There are chamfers everywhere! fix.
 # if any of the pieces had 2 or more grain lines detected, add a new step/window that requests the user to choose the correct grainline.
 # PS_Lulu pattern - got 2 seperate outlines instead of merging them together. Fix
