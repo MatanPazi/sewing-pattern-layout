@@ -404,7 +404,7 @@ def draw_layout(fabric_name: str, width_cm: float, length_cm: float,
         cx, cy = label_point_inside(poly, tolerance=0.5)
         ax.text(
             cx, cy,
-            f"{p['piece_index']}:{p['copy_index']}",
+            f"{p['piece_index'] + 1}:{p['copy_index'] + 1}",
             ha="center", va="center", fontsize=7, color="black",
         )
     ax.set_xlabel("width (cm) — cut edge")
