@@ -3,7 +3,7 @@
 place_patterns.py — V1 strip nesting for sewing-pattern outlines.
 
 Reads *_selected.json from outline_patterns_debug.py and packs each fabric's
-pieces onto a strip of fixed width, minimizing length.
+pieces onto a strip of fixed width, minimizing length and width.
 
 Rules (V1):
   - Grain (or fold-derived grain) aligned with fabric length (selvage).
@@ -242,7 +242,7 @@ def place_fabric(
     grid_cm: float = 0.5,
 ) -> tuple[list[dict], float]:
     """
-    Greedy bottom-left placement.
+    Greedy placement minimizing 0.9 * length + 0.1 * width of the used region.
     Returns (placements, length_used_cm).
     """
     half_gap = gap_cm * 0.5
@@ -261,7 +261,14 @@ def place_fabric(
     for k, idx in enumerate(order, start=1):
         inst = instances[idx]
         print(f"\r  placing {k}/{n}", end="", flush=True)
-        best = None  # (top_y, min_x, rotation, poly, buf)
+        best = None  # (score, left, rot, poly, buf)
+        best_score = None
+
+        cur_len = 0.0
+        cur_wid = 0.0
+        if placed_buffers:
+            cur_len = max(p.bounds[3] for p in placed_buffers)
+            cur_wid = max(p.bounds[2] for p in placed_buffers)
 
         for rot in inst["rotations"]:
             posed = apply_pose(inst["base_poly"], rot, inst["mirrored"])
@@ -276,11 +283,7 @@ def place_fabric(
             bw = buf.bounds[2] - buf.bounds[0]
             bh = buf.bounds[3] - buf.bounds[1]
 
-            current_length = 0.0
-            if placed_buffers:
-                current_length = max(p.bounds[3] for p in placed_buffers)
-
-            for y0 in _candidate_y_values(placed_buffers, bh, grid_cm, current_length):
+            for y0 in _candidate_y_values(placed_buffers, bh, grid_cm, cur_len):
                 for x0 in _candidate_x_values(placed_buffers, bw, fabric_width_cm, grid_cm):
                     dx = x0 - buf.bounds[0]
                     dy = y0 - buf.bounds[1]
@@ -302,10 +305,18 @@ def place_fabric(
                         continue
 
                     top = trial_poly.bounds[3]
+                    right = trial_poly.bounds[2]
                     left = trial_poly.bounds[0]
-                    score = (top, left)
-                    if best is None or score < (best[0], best[1]):
-                        best = (top, left, rot, trial_poly, trial_buf)
+                    used_len = max(cur_len, top)
+                    used_wid = max(cur_wid, right)
+                    score = 0.9 * used_len + 0.1 * used_wid
+                    if (
+                        best is None
+                        or score < best_score - 1e-12
+                        or (abs(score - best_score) <= 1e-12 and left < best[1])
+                    ):
+                        best_score = score
+                        best = (score, left, rot, trial_poly, trial_buf)
 
         if best is None:
             posed = apply_pose(inst["base_poly"], inst["rotations"][0], inst["mirrored"])
@@ -320,9 +331,15 @@ def place_fabric(
                 dx -= (trial.bounds[2] - fabric_width_cm)
                 trial = translate(posed, xoff=dx, yoff=dy)
             trial_buf = trial.buffer(half_gap, join_style=2)
-            best = (trial.bounds[3], trial.bounds[0], inst["rotations"][0], trial, trial_buf)
+            best = (
+                0.9 * trial.bounds[3] + 0.1 * trial.bounds[2],
+                trial.bounds[0],
+                inst["rotations"][0],
+                trial,
+                trial_buf,
+            )
 
-        top, left, rot, trial_poly, trial_buf = best
+        _score, left, rot, trial_poly, trial_buf = best
         placed_buffers.append(trial_buf)
         coords = list(trial_poly.exterior.coords)
 
