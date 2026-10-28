@@ -4455,4 +4455,4 @@ if __name__ == "__main__":
 
 
 # TODO
-# In pattern placement, prefer not only to minimize length, but also width. In approx a 0.9 length and 0.1 width ratio (Minimizing length is more important)
+# Handle pdfs with a large # of segments > 10e3. Either handle differently, warn user that this'll take a while, or avoid altogether.
