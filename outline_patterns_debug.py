@@ -2878,6 +2878,7 @@ def detect_special_lines(page,
                          point_tol=1.0,
                          min_crossbar_length=4.0,
                          max_crossbar_length=90.0,
+                         min_shaft_to_crossbar_ratio=1.5,
                          join_gap=8.0,
                          collinear_dot_min=0.98,
                          perp_dot_max=0.35,
@@ -2892,6 +2893,10 @@ def detect_special_lines(page,
     Shaft-first: all straight geometry is collected first; arrows are
     resolved only relative to concrete shafts. Short fold brackets are
     never excluded early.
+    
+    Fold crossbars must satisfy:
+        min_crossbar_length ≤ bar ≤ min(max_crossbar_length, shaft / min_shaft_to_crossbar_ratio)
+        so the shaft is at least min_shaft_to_crossbar_ratio times longer than each bar.
     """
     from collections import defaultdict
     import math
@@ -3112,6 +3117,13 @@ def detect_special_lines(page,
         if min_crossbar_length <= r["length"] <= max_crossbar_length
     ]
 
+    def max_crossbar_for_shaft(shaft_len):
+        """Upper length for a fold bracket on this shaft."""
+        return min(
+            max_crossbar_length,
+            shaft_len / min_shaft_to_crossbar_ratio,
+        )
+
     def arrow_hits_point(ap, point, radius):
         if dist(ap["center"], point) <= radius:
             return True
@@ -3152,6 +3164,8 @@ def detect_special_lines(page,
         ep1, ep2 = L["terminals"]
         ldir = L["direction"]
 
+        bar_max = max_crossbar_for_shaft(L["length"])
+
         # Grain ends: arrow near the shaft terminal itself
         grain_ends = []
         grain_arrows = []
@@ -3171,6 +3185,8 @@ def detect_special_lines(page,
                 if set(S["seg_idxs"]) & set(L["seg_idxs"]):
                     continue
                 if set(S["seg_idxs"]) & used_seg_idxs:
+                    continue
+                if S["length"] > bar_max:
                     continue
                 # real fold brackets match shaft stroke; arrow edges do not
                 if S["width"] != L["width"]:
@@ -3211,7 +3227,7 @@ def detect_special_lines(page,
             for ep in (ep1, ep2):
                 for si in L["seg_idxs"]:
                     s = segments[si]
-                    if s["length"] < min_crossbar_length or s["length"] > max_crossbar_length:
+                    if s["length"] < min_crossbar_length or s["length"] > bar_max:
                         continue
                     if s["width"] != L["width"]:
                         continue
