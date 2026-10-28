@@ -1371,9 +1371,18 @@ def step_write_selected(selected, out_dir: Path, stem: str):
         print(f"SELECTED image   → {png_path}")
 
 
-def group_faces_into_pieces(faces, min_shared_edge: float = 1.0):
+def group_faces_into_pieces(
+    faces,
+    min_shared_edge: float = 1.0,
+    parallel_dot_min: float = 0.98,
+    max_lateral: float = 1.5,
+):
     """
-    Faces that share a real edge belong to the same pattern piece.
+    Faces belong to the same pattern piece if they either:
+      1) share a real boundary edge (Shapely touches + intersection length), or
+      2) have long nearly-collinear, nearly-coincident exterior edges
+         (e.g. an external rectangle strip drawn along an outline edge).
+
     Returns faces_per_piece: list of (piece_idx, [face, ...]) for FaceSelector.
     """
     n = len(faces)
@@ -1390,16 +1399,93 @@ def group_faces_into_pieces(faces, min_shared_edge: float = 1.0):
         if ra != rb:
             parent[rb] = ra
 
+    def exterior_edges(poly):
+        if poly is None or poly.is_empty:
+            return []
+        if poly.geom_type == "MultiPolygon":
+            poly = max(poly.geoms, key=lambda g: g.area)
+        if poly.geom_type != "Polygon":
+            return []
+        coords = list(poly.exterior.coords)
+        edges = []
+        for k in range(len(coords) - 1):
+            a, b = coords[k], coords[k + 1]
+            if dist(a, b) < 1e-12:
+                continue
+            edges.append((a, b))
+        return edges
+
+    def collinear_overlap_len(a1, a2, b1, b2):
+        """
+        Length of projection overlap of segment b onto segment a's line,
+        if the segments are nearly parallel and within max_lateral.
+        Otherwise 0.
+        """
+        ax, ay = a2[0] - a1[0], a2[1] - a1[1]
+        a_len = math.hypot(ax, ay)
+        if a_len < 1e-12:
+            return 0.0
+        aux, auy = ax / a_len, ay / a_len
+
+        bx, by = b2[0] - b1[0], b2[1] - b1[1]
+        b_len = math.hypot(bx, by)
+        if b_len < 1e-12:
+            return 0.0
+        bux, buy = bx / b_len, by / b_len
+
+        if abs(aux * bux + auy * buy) < parallel_dot_min:
+            return 0.0
+
+        # Lateral distance: both endpoints of b from line of a
+        def lat(p):
+            return abs((p[0] - a1[0]) * auy - (p[1] - a1[1]) * aux)
+
+        if max(lat(b1), lat(b2)) > max_lateral:
+            return 0.0
+
+        # 1D positions along a's direction
+        def t(p):
+            return (p[0] - a1[0]) * aux + (p[1] - a1[1]) * auy
+
+        ta1, ta2 = 0.0, a_len
+        tb1, tb2 = t(b1), t(b2)
+        lo = max(min(ta1, ta2), min(tb1, tb2))
+        hi = min(max(ta1, ta2), max(tb1, tb2))
+        return max(0.0, hi - lo)
+
+    def collinear_shared_length(poly_a, poly_b):
+        edges_a = exterior_edges(poly_a)
+        edges_b = exterior_edges(poly_b)
+        best = 0.0
+        for a1, a2 in edges_a:
+            for b1, b2 in edges_b:
+                best = max(best, collinear_overlap_len(a1, a2, b1, b2))
+        return best
+
     for i in range(n):
         for j in range(i + 1, n):
-            gi, gj = faces[i]["polygon"], faces[j]["polygon"]
-            if not gi.touches(gj):
-                continue
+            gi = faces[i]["polygon"]
+            gj = faces[j]["polygon"]
+
+            # 1) Classic topological share
+            shared = 0.0
             try:
-                inter = gi.intersection(gj)
+                if gi.touches(gj):
+                    inter = gi.intersection(gj)
+                    shared = float(getattr(inter, "length", 0.0) or 0.0)
             except Exception:
+                shared = 0.0
+
+            if shared >= min_shared_edge:
+                union(i, j)
                 continue
-            if inter.length >= min_shared_edge:
+
+            # 2) Near-collinear full-side overlap (external strip on outline edge)
+            try:
+                col = collinear_shared_length(gi, gj)
+            except Exception:
+                col = 0.0
+            if col >= min_shared_edge:
                 union(i, j)
 
     groups = defaultdict(list)
@@ -1407,8 +1493,9 @@ def group_faces_into_pieces(faces, min_shared_edge: float = 1.0):
         groups[find(i)].append(i)
 
     faces_per_piece = []
-    for pi, idxs in enumerate(sorted(groups.values(),
-                                     key=lambda ix: -sum(faces[k]["area"] for k in ix))):
+    for pi, idxs in enumerate(
+        sorted(groups.values(), key=lambda ix: -sum(faces[k]["area"] for k in ix))
+    ):
         faces_per_piece.append((pi, [faces[k] for k in idxs]))
     return faces_per_piece
 
@@ -2367,37 +2454,41 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                     continue
                 try:
                     u = unary_union(polys)
+                    # Close micro-gaps so strip + body become one polygon
+                    u = u.buffer(0.5, join_style=2).buffer(-0.5, join_style=2)
                 except Exception:
                     continue
-                if u.geom_type == "MultiPolygon":
-                    u = max(u.geoms, key=lambda g: g.area)
-                if u.geom_type != "Polygon":
+                if u.is_empty:
                     continue
-                path = QPainterPath()
-                coords = list(u.exterior.coords)
-                path.moveTo(coords[0][0], coords[0][1])
-                for x, y in coords[1:]:
-                    path.lineTo(x, y)
-                path.closeSubpath()
-                glow = QGraphicsPathItem(path)
-                gpen = QPen(QColor(255, 255, 255, 180))
-                gpen.setCosmetic(True)
-                gpen.setWidthF(6)
-                glow.setPen(gpen)
-                glow.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-                glow.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                glow.setZValue(5)
-                core = QGraphicsPathItem(path)
-                cpen = QPen(QColor(0, 0, 0))
-                cpen.setCosmetic(True)
-                cpen.setWidthF(2.4)
-                core.setPen(cpen)
-                core.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-                core.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                core.setZValue(6)
-                self.scene.addItem(glow)
-                self.scene.addItem(core)
-                self.outline_items.extend((glow, core))
+                geoms = list(u.geoms) if u.geom_type == "MultiPolygon" else [u]
+                for g in geoms:
+                    if g.geom_type != "Polygon" or g.is_empty:
+                        continue
+                    path = QPainterPath()
+                    coords = list(g.exterior.coords)
+                    path.moveTo(coords[0][0], coords[0][1])
+                    for x, y in coords[1:]:
+                        path.lineTo(x, y)
+                    path.closeSubpath()
+                    glow = QGraphicsPathItem(path)
+                    gpen = QPen(QColor(255, 255, 255, 180))
+                    gpen.setCosmetic(True)
+                    gpen.setWidthF(6)
+                    glow.setPen(gpen)
+                    glow.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                    glow.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    glow.setZValue(5)
+                    core = QGraphicsPathItem(path)
+                    cpen = QPen(QColor(0, 0, 0))
+                    cpen.setCosmetic(True)
+                    cpen.setWidthF(2.4)
+                    core.setPen(cpen)
+                    core.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                    core.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    core.setZValue(6)
+                    self.scene.addItem(glow)
+                    self.scene.addItem(core)
+                    self.outline_items.extend((glow, core))
 
         def update_status(self):
             total = sum(len(fl) for fl in pieces.values())
@@ -2420,6 +2511,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                     continue
                 try:
                     u = unary_union(polys)
+                    u = u.buffer(0.5, join_style=2).buffer(-0.5, join_style=2)
                     if u.is_empty:
                         continue
                     if u.geom_type == "MultiPolygon":
@@ -4284,4 +4376,4 @@ if __name__ == "__main__":
 
 
 # TODO
-# PS_Lulu pattern - got 2 seperate outlines instead of merging them together. Fix
+# In pattern placement, prefer not only to minimize length, but also width. In approx a 0.9 length and 0.1 width ratio (Minimizing length is more important)
