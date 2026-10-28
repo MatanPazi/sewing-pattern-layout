@@ -3543,6 +3543,228 @@ def _orientation_record_from_fold(fold):
         "length": float(fold.get("length") or length),
     }
 
+def resolve_multiple_grains(selected):
+    """
+    If a piece has more than one grain line, ask the user which one to keep.
+    Folds are left unchanged. Returns False if the user cancels.
+    """
+    import sys
+    from PySide6.QtCore import Qt, QPointF, QLineF
+    from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
+    from PySide6.QtWidgets import (
+        QApplication, QDialog, QFrame, QGraphicsEllipseItem,
+        QGraphicsLineItem, QGraphicsPolygonItem, QGraphicsScene,
+        QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+        QMessageBox,
+    )
+
+    # Collect (fabric_index, piece_index, piece_ref) with 2+ grains
+    ambiguous = []
+    for fi, fab in enumerate(selected.get("fabrics") or []):
+        for pi, p in enumerate(fab.get("pieces") or []):
+            grains = [ln for ln in (p.get("lines") or []) if ln.get("type") == "grain"]
+            if len(grains) >= 2:
+                ambiguous.append((fi, pi, p, grains))
+
+    if not ambiguous:
+        return True
+
+    class GrainView(QGraphicsView):
+        def __init__(self, scene):
+            super().__init__(scene)
+            self.setRenderHint(QPainter.RenderHint.Antialiasing)
+            self.setFrameShape(QFrame.Shape.NoFrame)
+            self.setBackgroundBrush(QColor("#f3f3f3"))
+            self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+            self._panning = False
+            self._pan_pos = None
+
+        def wheelEvent(self, event):
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            self.scale(factor, factor)
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                # Let grain items receive the click first
+                item = self.itemAt(event.pos())
+                if item is not None and getattr(item, "grain_index", None) is not None:
+                    super().mousePressEvent(event)
+                    return
+                self._panning = True
+                self._pan_pos = event.pos()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event):
+            if self._panning and self._pan_pos is not None:
+                d = event.pos() - self._pan_pos
+                self._pan_pos = event.pos()
+                self.horizontalScrollBar().setValue(
+                    self.horizontalScrollBar().value() - d.x()
+                )
+                self.verticalScrollBar().setValue(
+                    self.verticalScrollBar().value() - d.y()
+                )
+                return
+            super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event):
+            if self._panning:
+                self._panning = False
+                self._pan_pos = None
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                event.accept()
+                return
+            super().mouseReleaseEvent(event)
+
+    class GrainLineItem(QGraphicsLineItem):
+        def __init__(self, x1, y1, x2, y2, index, on_pick):
+            super().__init__(x1, y1, x2, y2)
+            self.grain_index = index
+            self.on_pick = on_pick
+            self.setAcceptHoverEvents(True)
+            self._selected = False
+            self._apply_style()
+
+        def _apply_style(self):
+            pen = QPen(QColor("#e31a1c") if self._selected else QColor("#fb9a99"))
+            pen.setCosmetic(True)
+            pen.setWidthF(4.0 if self._selected else 2.5)
+            self.setPen(pen)
+            self.setZValue(10 if self._selected else 5)
+
+        def set_selected(self, selected):
+            self._selected = selected
+            self._apply_style()
+
+        def hoverEnterEvent(self, event):
+            if not self._selected:
+                pen = QPen(QColor("#e31a1c"))
+                pen.setCosmetic(True)
+                pen.setWidthF(3.5)
+                self.setPen(pen)
+            super().hoverEnterEvent(event)
+
+        def hoverLeaveEvent(self, event):
+            self._apply_style()
+            super().hoverLeaveEvent(event)
+
+        def mousePressEvent(self, event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.on_pick(self.grain_index)
+                event.accept()
+                return
+            super().mousePressEvent(event)
+
+    class PickGrainDialog(QDialog):
+        def __init__(self, piece, grains, piece_label, progress_label):
+            super().__init__()
+            self.setWindowTitle(f"Choose grain line – {progress_label}")
+            self.resize(1000, 750)
+            self.grains = grains
+            self.chosen = None
+            self.grain_items = []
+
+            self.scene = QGraphicsScene(self)
+            self.view = GrainView(self.scene)
+
+            pts = piece.get("points") or []
+            if len(pts) >= 3:
+                poly_item = QGraphicsPolygonItem(
+                    QPolygonF([QPointF(float(x), float(y)) for x, y in pts])
+                )
+                fill = QColor("#4c78a8")
+                fill.setAlpha(100)
+                poly_item.setBrush(QBrush(fill))
+                pen = QPen(QColor(0, 0, 0))
+                pen.setCosmetic(True)
+                pen.setWidthF(2.0)
+                poly_item.setPen(pen)
+                poly_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self.scene.addItem(poly_item)
+
+            def on_pick(index):
+                self.chosen = index
+                for it in self.grain_items:
+                    it.set_selected(it.grain_index == index)
+                self.cont.setEnabled(True)
+
+            for gi, ln in enumerate(grains):
+                eps = ln.get("endpoints") or []
+                if len(eps) < 2:
+                    continue
+                (x1, y1), (x2, y2) = eps[0], eps[1]
+                item = GrainLineItem(
+                    float(x1), float(y1), float(x2), float(y2),
+                    gi, on_pick,
+                )
+                # Wide invisible stroke for easier clicking
+                hit_pen = QPen(QColor(0, 0, 0, 1))
+                hit_pen.setCosmetic(True)
+                hit_pen.setWidthF(12.0)
+                # Keep visible pen via _apply_style; shape uses line
+                self.scene.addItem(item)
+                self.grain_items.append(item)
+                # Endpoint dots
+                for (x, y) in ((x1, y1), (x2, y2)):
+                    dot = QGraphicsEllipseItem(float(x) - 3, float(y) - 3, 6, 6)
+                    dot.setBrush(QBrush(QColor("#e31a1c")))
+                    dot.setPen(QPen(Qt.PenStyle.NoPen))
+                    dot.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    self.scene.addItem(dot)
+
+            if self.grain_items:
+                self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
+
+            hint = QLabel(
+                f"{piece_label}: {len(grains)} possible grain lines (red). "
+                "Click the real grain line, then Continue. "
+                "Drag empty area to pan, wheel to zoom."
+            )
+            hint.setWordWrap(True)
+
+            self.cont = QPushButton("Continue")
+            self.cont.setObjectName("approve")
+            self.cont.setEnabled(False)
+            cancel = QPushButton("Cancel")
+            self.cont.clicked.connect(self.accept)
+            cancel.clicked.connect(self.reject)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(cancel)
+            row.addWidget(self.cont)
+
+            lay = QVBoxLayout(self)
+            lay.addWidget(hint)
+            lay.addWidget(self.view, 1)
+            lay.addLayout(row)
+
+        def showEvent(self, event):
+            super().showEvent(event)
+            self.view.fitInView(
+                self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
+            )
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    n = len(ambiguous)
+    for k, (fi, pi, p, grains) in enumerate(ambiguous):
+        fab_name = (selected["fabrics"][fi].get("name") or f"fabric {fi + 1}")
+        piece_label = f"Fabric “{fab_name}”, piece {pi + 1}"
+        progress = f"{k + 1}/{n}"
+        dlg = PickGrainDialog(p, grains, piece_label, progress)
+        if dlg.exec() != QDialog.Accepted or dlg.chosen is None:
+            return False
+        keep = grains[dlg.chosen]
+        folds = [ln for ln in (p.get("lines") or []) if ln.get("type") == "fold"]
+        # Keep chosen grain + all folds (drop other grains)
+        p["lines"] = [keep] + folds
+
+    return True
+
 def expand_folds_in_selection(selected, parallel_dot_min=0.92):
     """
     For every piece with fold line(s), mirror across the nearest parallel
@@ -4034,6 +4256,13 @@ def main():
             )
 
     attach_lines_to_selection(selected, lines, tol=20.0)
+
+    if not resolve_multiple_grains(selected):
+        print("Grain selection cancelled – nothing written.")
+        pattern_doc.close()
+        instr_doc.close()
+        return
+
     expand_folds_in_selection(selected)
 
     print("\n=== Final cut outlines (after folds) ===")
@@ -4055,5 +4284,4 @@ if __name__ == "__main__":
 
 
 # TODO
-# if any of the pieces had 2 or more grain lines detected, add a new step/window that requests the user to choose the correct grainline.
 # PS_Lulu pattern - got 2 seperate outlines instead of merging them together. Fix
