@@ -1,189 +1,201 @@
 #!/usr/bin/env python3
 """
-Batch regression against golden outline txt files.
+Outline regression: patterns/*/regression/golden_selected.json
 
 Usage:
-  python regression_test.py
-  python regression_test.py --patterns-root /path/to/patterns
-  python regression_test.py --only patterns
+  python regression_test.py list
+  python regression_test.py init --case "Folder Name" --pattern-layer "SIZE" --lines-layer "LINES"
+  python regression_test.py update-golden --case "Folder Name"
+  python regression_test.py run
+  python regression_test.py run --only "Folder Name"
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-import fitz
-
-# Import your detection + writers from outline_patterns
-from outline_patterns import detect_patterns, detect_special_lines, write_patterns_txt, write_lines_txt
 from regression_lib import (
-    parse_patterns_txt,
-    parse_lines_txt,
-    compare_patterns,
-    compare_lines,
+    compare_selected,
+    default_manifest,
+    find_pattern_cases,
+    load_json,
+    load_manifest,
+    run_outline_headless,
+    save_json,
 )
 
 
-def find_pdf_for_golden(golden_txt: Path) -> Path | None:
-    """
-    Supports:
-      extracted_layers/golden/34_p00_patterns.txt  → extracted_layers/34.pdf
-      pattern/golden/34_p00_patterns.txt           → pattern/extracted_layers/34.pdf
-    """
-    import re
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent
 
-    name = golden_txt.name
-    # 34_p00_patterns.txt → 34
-    # REPÈRES_&_LÉGENDE_p00_lines.txt → REPÈRES_&_LÉGENDE
-    m = re.match(r"^(.*)_p\d{2}_(patterns|lines)\.txt$", name)
-    if not m:
-        layer_stem = name.split("_p")[0]
-    else:
-        layer_stem = m.group(1)
 
-    golden_dir = golden_txt.parent          # .../extracted_layers/golden
-    layers_dir = golden_dir.parent          # .../extracted_layers
+def cmd_list(cases):
+    print(f"{len(cases)} pattern folder(s):\n")
+    for c in cases:
+        flags = []
+        if c["manifest"].is_file():
+            flags.append("manifest")
+        if c["golden"].is_file():
+            flags.append("golden")
+        tag = ", ".join(flags) if flags else "no regression setup"
+        print(f"  {c['name']}")
+        print(f"    pdf:  {c['pdf'].name}")
+        print(f"    setup: {tag}")
 
-    candidates = [
-        layers_dir / f"{layer_stem}.pdf",                    # sibling of golden/
-        golden_dir.parent / "extracted_layers" / f"{layer_stem}.pdf",  # if golden at pattern root
-        golden_dir.parent.parent / "extracted_layers" / f"{layer_stem}.pdf",
-    ]
 
-    for c in candidates:
-        if c.exists():
-            return c.resolve()
+def cmd_init(case, pattern_layer: str, lines_layer: str, pages: str | None):
+    case["reg_dir"].mkdir(parents=True, exist_ok=True)
+    man = default_manifest(pattern_layer, lines_layer, pages)
+    save_json(case["manifest"], man)
+    print(f"Wrote {case['manifest']}")
+    print("Next: run outline interactively once, then:")
+    print(f'  python regression_test.py update-golden --case "{case["name"]}"')
 
-    # last resort: search nearby for exact stem
-    for root in {layers_dir, golden_dir.parent, golden_dir.parent.parent}:
-        if not root.exists():
+
+def cmd_update_golden(case):
+    """Copy latest *_selected.json from debug_outline into golden."""
+    if not case["manifest"].is_file():
+        raise SystemExit(f"Missing manifest. Run init first for {case['name']}")
+
+    debug = case["folder"] / "debug_outline"
+    candidates = sorted(debug.glob("*_selected.json")) if debug.is_dir() else []
+    # also allow regression/actual
+    if case["actual"].is_file():
+        candidates.append(case["actual"])
+
+    if not candidates:
+        raise SystemExit(
+            f"No *_selected.json under {debug}. "
+            "Run outline_patterns_debug.py on this PDF first."
+        )
+
+    src = candidates[-1]
+    data = load_json(src)
+    save_json(case["golden"], data)
+    print(f"Golden updated from {src}")
+    print(f"  -> {case['golden']}")
+
+
+def cmd_run(cases, only: str | None):
+    selected = cases
+    if only:
+        selected = [c for c in cases if only.lower() in c["name"].lower()]
+        if not selected:
+            raise SystemExit(f"No case matching {only!r}")
+
+    failed = 0
+    skipped = 0
+    passed = 0
+
+    for c in selected:
+        print("\n" + "=" * 60)
+        print(c["name"])
+        print("=" * 60)
+
+        if not c["manifest"].is_file():
+            print("SKIP: no manifest.json (run init)")
+            skipped += 1
             continue
-        hit = root / f"{layer_stem}.pdf"
-        if hit.exists():
-            return hit.resolve()
-        hits = list(root.glob(f"**/{layer_stem}.pdf"))
-        if hits:
-            return hits[0].resolve()
+        if not c["golden"].is_file():
+            print("SKIP: no golden_selected.json (run update-golden)")
+            skipped += 1
+            continue
 
-    return None
+        manifest = load_manifest(c["manifest"])
+        out_dir = c["reg_dir"] / "run"
+        try:
+            actual = run_outline_headless(c["pdf"], manifest, out_dir)
+        except Exception as e:
+            print(f"FAIL: run error: {e}")
+            failed += 1
+            continue
 
-
-def re_sub_page(stem: str) -> str:
-    import re
-    return re.sub(r"_p\d{2}$", "", stem)
-
-
-def parse_page_mode(golden_txt: Path) -> tuple[int, str]:
-    import re
-    name = golden_txt.name
-    mode = "patterns" if name.endswith("_patterns.txt") else "lines"
-    m = re.search(r"_p(\d{2})_", name)
-    page = int(m.group(1)) if m else 0
-    return page, mode
-
-
-def load_meta(golden_txt: Path) -> dict:
-    meta_path = golden_txt.with_suffix(".meta.json")
-    # also allow foo_p00_patterns.meta.json from full name
-    alt = Path(str(golden_txt) + ".meta.json")
-    for p in (meta_path, alt, golden_txt.parent / (golden_txt.stem + ".meta.json")):
-        if p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
-    return {}
-
-
-def run_case(golden_txt: Path, tmp_dir: Path) -> tuple[bool, str]:
-    meta = load_meta(golden_txt)
-    page, mode = parse_page_mode(golden_txt)
-    page = int(meta.get("page", page))
-    mode = meta.get("mode", mode)
-
-    pdf = Path(meta["pdf"]) if meta.get("pdf") else find_pdf_for_golden(golden_txt)
-    if pdf and not pdf.is_absolute():
-        pdf = (golden_txt.parent / pdf).resolve()
-    if pdf is None or not pdf.exists():
-        return False, f"PDF not found for golden {golden_txt}"
-
-    doc = fitz.open(pdf)
-    if page < 0 or page >= len(doc):
-        doc.close()
-        return False, f"bad page {page} for {pdf.name}"
-    page_obj = doc[page]
-
-    out_txt = tmp_dir / golden_txt.name
-
-    if mode == "patterns":
-        pieces = detect_patterns(
-            page_obj,
+        save_json(c["actual"], actual)
+        golden = load_json(c["golden"])
+        diffs = compare_selected(
+            golden,
+            actual,
+            abs_tol=float(manifest.get("float_abs", 0.05)),
+            rel_tol=float(manifest.get("float_rel", 1e-4)),
+            area_rel=float(manifest.get("area_rel", 1e-3)),
         )
-        write_patterns_txt(pieces, out_txt)
-        errors = compare_patterns(parse_patterns_txt(out_txt), parse_patterns_txt(golden_txt))
-    else:
-        lines = detect_special_lines(
-            page_obj,
-        )
-        write_lines_txt(lines, out_txt)
-        errors = compare_lines(parse_lines_txt(out_txt), parse_lines_txt(golden_txt))
+        if diffs:
+            print(f"FAIL ({len(diffs)} diff(s)):")
+            for d in diffs[:40]:
+                print(f"  - {d}")
+            if len(diffs) > 40:
+                print(f"  ... {len(diffs) - 40} more")
+            failed += 1
+        else:
+            print("PASS")
+            passed += 1
 
-    doc.close()
-    if errors:
-        msg = f"FAIL {golden_txt}\n  pdf={pdf.name} page={page} mode={mode}\n  " + "\n  ".join(errors)
-        return False, msg
-    return True, f"PASS {golden_txt.name} ({pdf.name} p{page} {mode})"
+    print("\n" + "-" * 40)
+    print(f"passed={passed}  failed={failed}  skipped={skipped}")
+    return 0 if failed == 0 else 1
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch regression for outline goldens")
+    parser = argparse.ArgumentParser(description="Outline selected.json regression")
     parser.add_argument(
         "--patterns-root",
         type=Path,
-        default=Path(__file__).resolve().parent / "patterns",
-        help="Root folder containing pattern subfolders with golden/",
+        default=None,
+        help="Default: <repo>/patterns",
     )
-    parser.add_argument("--only", choices=["patterns", "lines", "all"], default="all")
-    parser.add_argument("--tmp", type=Path, default=Path("/tmp/outline_regression"))
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="List pattern folders and setup status")
+
+    p_init = sub.add_parser("init", help="Create regression/manifest.json for a case")
+    p_init.add_argument("--case", required=True, help="Folder name under patterns/")
+    p_init.add_argument("--pattern-layer", required=True, help="Layer name or key")
+    p_init.add_argument("--lines-layer", required=True, help="Layer name or key")
+    p_init.add_argument("--pages", default=None, help='Optional page spec e.g. "0-2"')
+
+    p_up = sub.add_parser("update-golden", help="Copy latest selected.json to golden")
+    p_up.add_argument("--case", required=True)
+
+    p_run = sub.add_parser("run", help="Headless re-run and compare to golden")
+    p_run.add_argument("--only", default=None, help="Substring filter on folder name")
+
     args = parser.parse_args()
+    root = args.patterns_root or (repo_root() / "patterns")
+    cases = find_pattern_cases(root)
 
-    root = args.patterns_root
-    goldens = sorted(root.glob("**/golden/*_patterns.txt")) + sorted(
-        root.glob("**/golden/*_lines.txt")
-    )
-    if args.only == "patterns":
-        goldens = [g for g in goldens if g.name.endswith("_patterns.txt")]
-    elif args.only == "lines":
-        goldens = [g for g in goldens if g.name.endswith("_lines.txt")]
+    if args.cmd == "list":
+        cmd_list(cases)
+        return 0
 
-    if not goldens:
-        print(f"No goldens under {root}")
-        return 1
+    def pick(name: str):
+        hits = [c for c in cases if c["name"] == name or name.lower() in c["name"].lower()]
+        if not hits:
+            raise SystemExit(f"Case not found: {name!r}")
+        if len(hits) > 1:
+            # prefer exact
+            exact = [c for c in hits if c["name"] == name]
+            if len(exact) == 1:
+                return exact[0]
+            raise SystemExit(
+                "Ambiguous case; matches: " + ", ".join(c["name"] for c in hits)
+            )
+        return hits[0]
 
-    args.tmp.mkdir(parents=True, exist_ok=True)
-    passes = fails = 0
-    details = []
+    if args.cmd == "init":
+        cmd_init(pick(args.case), args.pattern_layer, args.lines_layer, args.pages)
+        return 0
 
-    print(f"Found {len(goldens)} golden file(s) under {root}\n")
-    for g in goldens:
-        ok, msg = run_case(g, args.tmp)
-        print(msg)
-        if ok:
-            passes += 1
-        else:
-            fails += 1
-            details.append(msg)
+    if args.cmd == "update-golden":
+        cmd_update_golden(pick(args.case))
+        return 0
 
-    print("\n" + "=" * 60)
-    print(f"Summary: {passes} passed, {fails} failed, {len(goldens)} total")
-    if fails:
-        print("\nFailures:")
-        for d in details:
-            print("-" * 40)
-            print(d)
-        return 1
-    return 0
+    if args.cmd == "run":
+        return cmd_run(cases, args.only)
+
+    return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main() or 0)
