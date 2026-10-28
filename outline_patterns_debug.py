@@ -3491,17 +3491,40 @@ def attach_lines_to_selection(selected, lines, tol=20.0):
             shafts.append((obj, unary_union(parts)))
 
     def record(obj):
-        a, b = obj["shaft"]["endpoints"]
+        segs = []
+        for sa, sb in obj.get("shaft", {}).get("segments") or []:
+            if dist(sa, sb) < 1e-9:
+                continue
+            segs.append([
+                [float(sa[0]), float(sa[1])],
+                [float(sb[0]), float(sb[1])],
+            ])
+
+        a = b = None
+        if segs:
+            # Longest segment defines the grain axis (stable)
+            sa, sb = max(segs, key=lambda s: dist(s[0], s[1]))
+            a, b = sa, sb
+            length = sum(dist(s[0], s[1]) for s in segs)
+        else:
+            ea, eb = obj["shaft"]["endpoints"]
+            a = [float(ea[0]), float(ea[1])]
+            b = [float(eb[0]), float(eb[1])]
+            length = float(obj["shaft"].get("length") or dist(a, b) or 1.0)
+
         dx, dy = float(b[0] - a[0]), float(b[1] - a[1])
-        length = math.hypot(dx, dy) or 1.0
+        seg_len = math.hypot(dx, dy) or 1.0
         if dx < 0 or (abs(dx) < 1e-9 and dy < 0):
             dx, dy = -dx, -dy
+            a, b = b, a
+
         return {
             "type": obj["type"],
-            "endpoints": [[float(a[0]), float(a[1])], [float(b[0]), float(b[1])]],
-            "direction": [dx / length, dy / length],
+            "endpoints": [a, b],
+            "direction": [dx / seg_len, dy / seg_len],
             "angle_deg": math.degrees(math.atan2(dy, dx)) % 180.0,
-            "length": float(obj["shaft"].get("length") or length),
+            "length": float(length if length > 0 else seg_len),
+            "segments": segs,
         }
 
     for fab in selected.get("fabrics", []):
@@ -3712,34 +3735,58 @@ def resolve_multiple_grains(selected):
             super().mouseReleaseEvent(event)
 
     class GrainLineItem(QGraphicsLineItem):
+        HIT_WIDTH = 25.0  # PDF units; raise to 35 if still tight
+
         def __init__(self, x1, y1, x2, y2, index, on_pick):
             super().__init__(x1, y1, x2, y2)
             self.grain_index = index
             self.on_pick = on_pick
             self.setAcceptHoverEvents(True)
             self._selected = False
+            self._hovered = False
             self._apply_style()
 
-        def _apply_style(self):
-            pen = QPen(QColor("#e31a1c") if self._selected else QColor("#fb9a99"))
+        def _pen(self, color, width):
+            pen = QPen(color)
             pen.setCosmetic(True)
-            pen.setWidthF(4.0 if self._selected else 2.5)
-            self.setPen(pen)
-            self.setZValue(10 if self._selected else 5)
+            pen.setWidthF(width)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            return pen
+
+        def _apply_style(self):
+            if self._selected:
+                self.setPen(self._pen(QColor("#1a7f37"), 5.0))
+                self.setZValue(12)
+            elif self._hovered:
+                self.setPen(self._pen(QColor("#ff6b00"), 3.5))
+                self.setZValue(11)
+            else:
+                self.setPen(self._pen(QColor("#e31a1c"), 2.0))
+                self.setZValue(8)
 
         def set_selected(self, selected):
             self._selected = selected
             self._apply_style()
 
+        def shape(self):
+            from PySide6.QtGui import QPainterPath, QPainterPathStroker
+            path = QPainterPath()
+            ln = self.line()
+            path.moveTo(ln.p1())
+            path.lineTo(ln.p2())
+            stroker = QPainterPathStroker()
+            stroker.setWidth(self.HIT_WIDTH)
+            stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+            stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            return stroker.createStroke(path)
+
         def hoverEnterEvent(self, event):
-            if not self._selected:
-                pen = QPen(QColor("#e31a1c"))
-                pen.setCosmetic(True)
-                pen.setWidthF(3.5)
-                self.setPen(pen)
+            self._hovered = True
+            self._apply_style()
             super().hoverEnterEvent(event)
 
         def hoverLeaveEvent(self, event):
+            self._hovered = False
             self._apply_style()
             super().hoverLeaveEvent(event)
 
@@ -3784,28 +3831,44 @@ def resolve_multiple_grains(selected):
                 self.cont.setEnabled(True)
 
             for gi, ln in enumerate(grains):
-                eps = ln.get("endpoints") or []
-                if len(eps) < 2:
-                    continue
-                (x1, y1), (x2, y2) = eps[0], eps[1]
+                segs = [
+                    s for s in (ln.get("segments") or [])
+                    if dist(s[0], s[1]) >= 1e-9
+                ]
+                # Drop tiny stubs (often broken arrow geometry in shaft)
+                if ln.get("length"):
+                    min_len = 0.08 * float(ln["length"])
+                    segs = [s for s in segs if dist(s[0], s[1]) >= min_len]
+                if not segs:
+                    eps = ln.get("endpoints") or []
+                    if len(eps) >= 2:
+                        segs = [eps]
+
+                # Clickable item spans full shaft (first point → last point)
+                (x1, y1) = segs[0][0]
+                (x2, y2) = segs[-1][1]
                 item = GrainLineItem(
                     float(x1), float(y1), float(x2), float(y2),
                     gi, on_pick,
                 )
-                # Wide invisible stroke for easier clicking
-                hit_pen = QPen(QColor(0, 0, 0, 1))
-                hit_pen.setCosmetic(True)
-                hit_pen.setWidthF(12.0)
-                # Keep visible pen via _apply_style; shape uses line
                 self.scene.addItem(item)
                 self.grain_items.append(item)
-                # Endpoint dots
-                for (x, y) in ((x1, y1), (x2, y2)):
-                    dot = QGraphicsEllipseItem(float(x) - 3, float(y) - 3, 6, 6)
-                    dot.setBrush(QBrush(QColor("#e31a1c")))
-                    dot.setPen(QPen(Qt.PenStyle.NoPen))
-                    dot.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                    self.scene.addItem(dot)
+
+                # If shaft is multi-segment, draw the middle parts as non-click decoration
+                # matching the same default red (selection still driven by GrainLineItem)
+                if len(segs) > 1:
+                    for sa, sb in segs:
+                        mid = QGraphicsLineItem(
+                            float(sa[0]), float(sa[1]),
+                            float(sb[0]), float(sb[1]),
+                        )
+                        pen = QPen(QColor("#e31a1c"))
+                        pen.setCosmetic(True)
+                        pen.setWidthF(2.0)
+                        mid.setPen(pen)
+                        mid.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                        mid.setZValue(7)
+                        self.scene.addItem(mid)
 
             if self.grain_items:
                 self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
@@ -4376,3 +4439,4 @@ if __name__ == "__main__":
 
 
 # TODO
+# In pattern placement, prefer not only to minimize length, but also width. In approx a 0.9 length and 0.1 width ratio (Minimizing length is more important)
