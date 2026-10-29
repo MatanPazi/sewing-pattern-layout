@@ -108,22 +108,17 @@ def _detect_content_rect(doc, page_numbers):
     return fitz.Rect(med_x0, med_y0, med_x0 + med_w, med_y0 + med_h)
 
 
-def assemble_pages(pattern_doc, pattern_pages,
-                   instr_doc, instr_pages,
-                   overlap=0.0):
+def compute_assembly_layout(ref_doc, ref_pages, instr_doc, instr_pages, overlap=0.0):
     """
-    Assemble multi-page pattern into a single global coordinate system.
-    Returns a dict containing the transformed paths and a correctly sized canvas.
+    Decide tile size + grid + per-page transforms once.
+    Overflow is measured on ref_doc/ref_pages (use the pattern layer).
+    Content rect is taken from instr_doc when possible.
     """
-    import math
     import numpy as np
 
-    if not pattern_pages:
-        raise ValueError("No pattern pages given")
+    if not ref_pages:
+        raise ValueError("No pages given for layout")
 
-    # ------------------------------------------------------------------
-    # 1. Detect content rectangle from the instruction layer
-    # ------------------------------------------------------------------
     content_rect = _detect_content_rect(instr_doc, instr_pages)
 
     if content_rect is not None:
@@ -131,27 +126,23 @@ def assemble_pages(pattern_doc, pattern_pages,
         tile_h = content_rect.height
         print(f"Content rectangle detected: {tile_w:.1f} × {tile_h:.1f}")
     else:
-        sample = pattern_doc[pattern_pages[0]]
+        sample = ref_doc[ref_pages[0]]
         tile_w = sample.rect.width
         tile_h = sample.rect.height
         content_rect = None
         print("No consistent content rectangle – using full page size")
 
-    # ------------------------------------------------------------------
-    # 2. Intelligent layout decision based on boundary overflows
-    # ------------------------------------------------------------------
-    n = len(pattern_pages)
+    n = len(ref_pages)
     horizontal_overflow = False
     vertical_overflow = False
 
-    ref_x0 = content_rect.x0 if content_rect else 0
-    ref_y0 = content_rect.y0 if content_rect else 0
+    ref_x0 = content_rect.x0 if content_rect else 0.0
+    ref_y0 = content_rect.y0 if content_rect else 0.0
     ref_x1 = content_rect.x1 if content_rect else tile_w
     ref_y1 = content_rect.y1 if content_rect else tile_h
 
-    # Scan drawings to see which boundary is crossed
-    for pno in pattern_pages:
-        page = pattern_doc[pno]
+    for pno in ref_pages:
+        page = ref_doc[pno]
         for path in page.get_drawings():
             for item in path.get("items", []):
                 op = item[0]
@@ -174,7 +165,6 @@ def assemble_pages(pattern_doc, pattern_pages,
                     if p.y > ref_y1 + 1.0 or p.y < ref_y0 - 1.0:
                         vertical_overflow = True
 
-    # Determine layout orientation based on overflow direction
     if horizontal_overflow and not vertical_overflow:
         cols, rows = n, 1
         print("Detected horizontal extension: arranging pages in a single row")
@@ -182,8 +172,7 @@ def assemble_pages(pattern_doc, pattern_pages,
         cols, rows = 1, n
         print("Detected vertical extension: arranging pages in a single column")
     else:
-        # Fallback based on page orientation if overflow is ambiguous or absent
-        sample = pattern_doc[pattern_pages[0]]
+        sample = ref_doc[ref_pages[0]]
         if sample.rect.width >= sample.rect.height:
             cols, rows = n, 1
             print("No clear overflow detected, defaulting to horizontal layout (landscape)")
@@ -193,30 +182,60 @@ def assemble_pages(pattern_doc, pattern_pages,
 
     print(f"Using grid {rows}×{cols}")
 
-    # ------------------------------------------------------------------
-    # 3. Place every path and collect real bounding box
-    # ------------------------------------------------------------------
-    global_paths = []
-    page_transforms = []
-    all_x = []
-    all_y = []
-
-    for idx, pno in enumerate(pattern_pages):
-        page = pattern_doc[pno]
+    # pno → Matrix (same for pattern and lines)
+    page_transforms = {}
+    for idx, pno in enumerate(ref_pages):
         row = idx // cols
         col = idx % cols
-
-        # Base translation – place tiles next to each other
         tx = col * (tile_w - overlap)
         ty = row * (tile_h - overlap)
-
-        # Optional origin shift only if we have a content rect
         if content_rect is not None:
             tx -= content_rect.x0
             ty -= content_rect.y0
+        page_transforms[pno] = fitz.Matrix(1, 0, 0, 1, tx, ty)
 
-        mat = fitz.Matrix(1, 0, 0, 1, tx, ty)
-        page_transforms.append((pno, mat))
+    return {
+        "content_rect": content_rect,
+        "tile_w": tile_w,
+        "tile_h": tile_h,
+        "grid": (cols, rows),
+        "overlap": overlap,
+        "page_transforms": page_transforms,
+        "ref_pages": list(ref_pages),
+    }
+
+
+def assemble_pages_with_layout(doc, pages, layout):
+    """
+    Place every page of `doc` listed in `pages` using a shared layout.
+    """
+    tile_w = layout["tile_w"]
+    tile_h = layout["tile_h"]
+    page_transforms = layout["page_transforms"]
+    cols, rows = layout["grid"]
+    content_rect = layout["content_rect"]
+    overlap = layout["overlap"]
+
+    global_paths = []
+    all_x = []
+    all_y = []
+    used_transforms = []
+
+    for idx, pno in enumerate(pages):
+        page = doc[pno]
+        mat = page_transforms.get(pno)
+        if mat is None:
+            # Page not in layout ref set: place by index with same grid rules
+            row = idx // cols
+            col = idx % cols
+            tx = col * (tile_w - overlap)
+            ty = row * (tile_h - overlap)
+            if content_rect is not None:
+                tx -= content_rect.x0
+                ty -= content_rect.y0
+            mat = fitz.Matrix(1, 0, 0, 1, tx, ty)
+        used_transforms.append((pno, mat))
+        tx, ty = mat.e, mat.f
 
         for path in page.get_drawings():
             new_items = []
@@ -257,24 +276,17 @@ def assemble_pages(pattern_doc, pattern_pages,
                 else:
                     new_items.append(item)
 
-            # ---- critical: keep a correct rect for this path ----
-            new_path = dict(path)  # preserve width, color, etc.
+            new_path = dict(path)
             new_path["items"] = new_items
             if xs and ys:
                 new_path["rect"] = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
             else:
-                # fallback – should rarely happen
                 new_path["rect"] = fitz.Rect(tx, ty, tx + tile_w, ty + tile_h)
 
             global_paths.append(new_path)
-
-            # also collect for the overall canvas
             all_x.extend(xs)
             all_y.extend(ys)
 
-    # ------------------------------------------------------------------
-    # 4. Real bounding box of everything + padding
-    # ------------------------------------------------------------------
     if not all_x:
         global_rect = fitz.Rect(0, 0, tile_w, tile_h)
     else:
@@ -294,8 +306,22 @@ def assemble_pages(pattern_doc, pattern_pages,
         "tile_w": tile_w,
         "tile_h": tile_h,
         "grid": (cols, rows),
-        "page_transforms": page_transforms,
+        "page_transforms": used_transforms,
+        "layout": layout,
     }
+
+
+def assemble_pages(pattern_doc, pattern_pages,
+                   instr_doc, instr_pages,
+                   overlap=0.0):
+    """
+    Back-compat wrapper: layout from pattern pages, place those pages only.
+    Prefer compute_assembly_layout + assemble_pages_with_layout in main().
+    """
+    layout = compute_assembly_layout(
+        pattern_doc, pattern_pages, instr_doc, instr_pages, overlap=overlap,
+    )
+    return assemble_pages_with_layout(pattern_doc, pattern_pages, layout)
 
 # Helpers
 
@@ -4339,20 +4365,19 @@ def main():
     print(f"Out dir       : {out_dir}")
 
     # ----- assemble both PDFs into one canvas -----
-    print("\n=== Assembling pattern pages ===")
-    assembled_pat = assemble_pages(
+    print("\n=== Assembly layout (shared) ===")
+    layout = compute_assembly_layout(
         pattern_doc, pat_pages,
         instr_doc, line_pages,
         overlap=args.overlap,
     )
+
+    print("\n=== Assembling pattern pages ===")
+    assembled_pat = assemble_pages_with_layout(pattern_doc, pat_pages, layout)
     page = AssembledPage(assembled_pat["paths"], assembled_pat["global_rect"])
 
     print("\n=== Assembling lines / instructions pages ===")
-    assembled_lines = assemble_pages(
-        instr_doc, line_pages,
-        instr_doc, line_pages,
-        overlap=args.overlap,
-    )
+    assembled_lines = assemble_pages_with_layout(instr_doc, line_pages, layout)
     page_lines = AssembledPage(
         assembled_lines["paths"], assembled_lines["global_rect"]
     )
