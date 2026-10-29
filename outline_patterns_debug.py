@@ -3879,12 +3879,6 @@ def resolve_piece_lines(selected):
             self.scene = QGraphicsScene(self)
             self.view = LineView(self.scene)
 
-            gap = 80.0
-            cursor_x = 0.0
-            row_y = 0.0
-            row_h = 0.0
-            max_row_w = 5000.0
-
             def toggle(key):
                 self.selected[key] = not self.selected.get(key, False)
                 it = self.item_by_key.get(key)
@@ -3896,23 +3890,8 @@ def resolve_piece_lines(selected):
                 if len(pts) < 3:
                     continue
 
-                # Layout pieces in rows (same idea as preview)
-                xs = [float(x) for x, y in pts]
-                ys = [float(y) for x, y in pts]
-                minx, maxx = min(xs), max(xs)
-                miny, maxy = min(ys), max(ys)
-                w, h = maxx - minx, maxy - miny
-                if cursor_x > 0 and cursor_x + w > max_row_w:
-                    row_y += row_h + gap
-                    cursor_x = 0.0
-                    row_h = 0.0
-                dx = cursor_x - minx
-                dy = row_y - miny
-                cursor_x += w + gap
-                row_h = max(row_h, h)
-
                 poly = QGraphicsPolygonItem(
-                    QPolygonF([QPointF(float(x) + dx, float(y) + dy) for x, y in pts])
+                    QPolygonF([QPointF(float(x), float(y)) for x, y in pts])
                 )
                 fill = QColor("#4c78a8")
                 fill.setAlpha(90)
@@ -3931,8 +3910,8 @@ def resolve_piece_lines(selected):
                     (x1, y1), (x2, y2) = eps[0], eps[1]
                     key = (ei, li)
                     item = ToggleLineItem(
-                        float(x1) + dx, float(y1) + dy,
-                        float(x2) + dx, float(y2) + dy,
+                        float(x1), float(y1),
+                        float(x2), float(y2),
                         key,
                         ln.get("type") or "grain",
                         self.selected.get(key, False),
