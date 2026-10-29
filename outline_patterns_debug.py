@@ -3674,33 +3674,56 @@ def _orientation_record_from_fold(fold):
         "length": float(fold.get("length") or length),
     }
 
-def resolve_multiple_grains(selected):
+def resolve_piece_lines(selected):
     """
-    If a piece has more than one grain line, ask the user which one to keep.
-    Folds are left unchanged. Returns False if the user cancels.
+    Always show a line-picker for all pieces that have any grain/fold.
+    User can mark/unmark any line. Defaults:
+      - one grain  → selected
+      - many grains → longest selected
+      - one fold   → selected
+      - many folds → longest selected
+    Selected grain = red/green family; selected fold = purple.
+    Returns False if cancelled.
     """
     import sys
-    from PySide6.QtCore import Qt, QPointF, QLineF
+    from PySide6.QtCore import Qt, QPointF
     from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF
     from PySide6.QtWidgets import (
-        QApplication, QDialog, QFrame, QGraphicsEllipseItem,
-        QGraphicsLineItem, QGraphicsPolygonItem, QGraphicsScene,
-        QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
-        QMessageBox,
+        QApplication, QDialog, QFrame, QGraphicsLineItem, QGraphicsPolygonItem,
+        QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
     )
 
-    # Collect (fabric_index, piece_index, piece_ref) with 2+ grains
-    ambiguous = []
+    # Flatten (fab_i, piece_i, piece, lines) for every piece that has lines
+    entries = []
     for fi, fab in enumerate(selected.get("fabrics") or []):
         for pi, p in enumerate(fab.get("pieces") or []):
-            grains = [ln for ln in (p.get("lines") or []) if ln.get("type") == "grain"]
-            if len(grains) >= 2:
-                ambiguous.append((fi, pi, p, grains))
+            lines = [
+                ln for ln in (p.get("lines") or [])
+                if ln.get("type") in ("grain", "fold")
+            ]
+            if not lines:
+                continue
+            entries.append((fi, pi, p, lines))
 
-    if not ambiguous:
+    if not entries:
         return True
 
-    class GrainView(QGraphicsView):
+    def default_selected_indices(lines):
+        """Set of indices selected by default."""
+        grains = [(i, ln) for i, ln in enumerate(lines) if ln.get("type") == "grain"]
+        folds = [(i, ln) for i, ln in enumerate(lines) if ln.get("type") == "fold"]
+        chosen = set()
+        if len(grains) == 1:
+            chosen.add(grains[0][0])
+        elif len(grains) > 1:
+            chosen.add(max(grains, key=lambda t: float(t[1].get("length") or 0.0))[0])
+        if len(folds) == 1:
+            chosen.add(folds[0][0])
+        elif len(folds) > 1:
+            chosen.add(max(folds, key=lambda t: float(t[1].get("length") or 0.0))[0])
+        return chosen
+
+    class LineView(QGraphicsView):
         def __init__(self, scene):
             super().__init__(scene)
             self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -3716,9 +3739,8 @@ def resolve_multiple_grains(selected):
 
         def mousePressEvent(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
-                # Let grain items receive the click first
                 item = self.itemAt(event.pos())
-                if item is not None and getattr(item, "grain_index", None) is not None:
+                if item is not None and getattr(item, "line_key", None) is not None:
                     super().mousePressEvent(event)
                     return
                 self._panning = True
@@ -3750,15 +3772,16 @@ def resolve_multiple_grains(selected):
                 return
             super().mouseReleaseEvent(event)
 
-    class GrainLineItem(QGraphicsLineItem):
-        HIT_WIDTH = 25.0  # PDF units; raise to 35 if still tight
+    class ToggleLineItem(QGraphicsLineItem):
+        HIT_WIDTH = 28.0
 
-        def __init__(self, x1, y1, x2, y2, index, on_pick):
+        def __init__(self, x1, y1, x2, y2, line_key, line_type, selected, on_toggle):
             super().__init__(x1, y1, x2, y2)
-            self.grain_index = index
-            self.on_pick = on_pick
+            self.line_key = line_key
+            self.line_type = line_type  # "grain" | "fold"
+            self._selected = selected
+            self.on_toggle = on_toggle
             self.setAcceptHoverEvents(True)
-            self._selected = False
             self._hovered = False
             self._apply_style()
 
@@ -3770,15 +3793,15 @@ def resolve_multiple_grains(selected):
             return pen
 
         def _apply_style(self):
-            if self._selected:
-                self.setPen(self._pen(QColor("#1a7f37"), 5.0))
-                self.setZValue(12)
-            elif self._hovered:
-                self.setPen(self._pen(QColor("#ff6b00"), 3.5))
-                self.setZValue(11)
+            if self.line_type == "grain":
+                # selected grain = strong red; idle = pale red
+                color = QColor("#c1121f") if self._selected else QColor("#f1a7ad")
             else:
-                self.setPen(self._pen(QColor("#e31a1c"), 2.0))
-                self.setZValue(8)
+                # selected fold = strong purple; idle = pale purple
+                color = QColor("#6a3d9a") if self._selected else QColor("#c5b0d5")
+            width = 5.0 if self._selected else (3.5 if self._hovered else 2.0)
+            self.setPen(self._pen(color, width))
+            self.setZValue(12 if self._selected else (10 if self._hovered else 8))
 
         def set_selected(self, selected):
             self._selected = selected
@@ -3808,104 +3831,113 @@ def resolve_multiple_grains(selected):
 
         def mousePressEvent(self, event):
             if event.button() == Qt.MouseButton.LeftButton:
-                self.on_pick(self.grain_index)
+                self.on_toggle(self.line_key)
                 event.accept()
                 return
             super().mousePressEvent(event)
 
-    class PickGrainDialog(QDialog):
-        def __init__(self, piece, grains, piece_label, progress_label):
+    class PickLinesDialog(QDialog):
+        def __init__(self, entries):
             super().__init__()
-            self.setWindowTitle(f"Choose grain line – {progress_label}")
-            self.resize(1000, 750)
-            self.grains = grains
-            self.chosen = None
-            self.grain_items = []
+            self.setWindowTitle("Choose grain / fold lines")
+            self.resize(1200, 850)
+            self.entries = entries
+            # key = (entry_index, line_index) → selected?
+            self.selected = {}
+            self.item_by_key = {}
+
+            for ei, (_fi, _pi, _p, lines) in enumerate(entries):
+                for li in default_selected_indices(lines):
+                    self.selected[(ei, li)] = True
 
             self.scene = QGraphicsScene(self)
-            self.view = GrainView(self.scene)
+            self.view = LineView(self.scene)
 
-            pts = piece.get("points") or []
-            if len(pts) >= 3:
-                poly_item = QGraphicsPolygonItem(
-                    QPolygonF([QPointF(float(x), float(y)) for x, y in pts])
+            gap = 80.0
+            cursor_x = 0.0
+            row_y = 0.0
+            row_h = 0.0
+            max_row_w = 5000.0
+
+            def toggle(key):
+                self.selected[key] = not self.selected.get(key, False)
+                it = self.item_by_key.get(key)
+                if it is not None:
+                    it.set_selected(self.selected[key])
+
+            for ei, (fi, pi, p, lines) in enumerate(entries):
+                pts = p.get("points") or []
+                if len(pts) < 3:
+                    continue
+
+                # Layout pieces in rows (same idea as preview)
+                xs = [float(x) for x, y in pts]
+                ys = [float(y) for x, y in pts]
+                minx, maxx = min(xs), max(xs)
+                miny, maxy = min(ys), max(ys)
+                w, h = maxx - minx, maxy - miny
+                if cursor_x > 0 and cursor_x + w > max_row_w:
+                    row_y += row_h + gap
+                    cursor_x = 0.0
+                    row_h = 0.0
+                dx = cursor_x - minx
+                dy = row_y - miny
+                cursor_x += w + gap
+                row_h = max(row_h, h)
+
+                poly = QGraphicsPolygonItem(
+                    QPolygonF([QPointF(float(x) + dx, float(y) + dy) for x, y in pts])
                 )
                 fill = QColor("#4c78a8")
-                fill.setAlpha(100)
-                poly_item.setBrush(QBrush(fill))
+                fill.setAlpha(90)
+                poly.setBrush(QBrush(fill))
                 pen = QPen(QColor(0, 0, 0))
                 pen.setCosmetic(True)
                 pen.setWidthF(2.0)
-                poly_item.setPen(pen)
-                poly_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                self.scene.addItem(poly_item)
+                poly.setPen(pen)
+                poly.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self.scene.addItem(poly)
 
-            def on_pick(index):
-                self.chosen = index
-                for it in self.grain_items:
-                    it.set_selected(it.grain_index == index)
-                self.cont.setEnabled(True)
-
-            for gi, ln in enumerate(grains):
-                segs = [
-                    s for s in (ln.get("segments") or [])
-                    if dist(s[0], s[1]) >= 1e-9
-                ]
-                # Drop tiny stubs (often broken arrow geometry in shaft)
-                if ln.get("length"):
-                    min_len = 0.08 * float(ln["length"])
-                    segs = [s for s in segs if dist(s[0], s[1]) >= min_len]
-                if not segs:
+                for li, ln in enumerate(lines):
                     eps = ln.get("endpoints") or []
-                    if len(eps) >= 2:
-                        segs = [eps]
+                    if len(eps) < 2:
+                        continue
+                    (x1, y1), (x2, y2) = eps[0], eps[1]
+                    key = (ei, li)
+                    item = ToggleLineItem(
+                        float(x1) + dx, float(y1) + dy,
+                        float(x2) + dx, float(y2) + dy,
+                        key,
+                        ln.get("type") or "grain",
+                        self.selected.get(key, False),
+                        toggle,
+                    )
+                    self.scene.addItem(item)
+                    self.item_by_key[key] = item
 
-                # Clickable item spans full shaft (first point → last point)
-                (x1, y1) = segs[0][0]
-                (x2, y2) = segs[-1][1]
-                item = GrainLineItem(
-                    float(x1), float(y1), float(x2), float(y2),
-                    gi, on_pick,
+            if self.scene.items():
+                self.scene.setSceneRect(
+                    self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40)
                 )
-                self.scene.addItem(item)
-                self.grain_items.append(item)
-
-                # If shaft is multi-segment, draw the middle parts as non-click decoration
-                # matching the same default red (selection still driven by GrainLineItem)
-                if len(segs) > 1:
-                    for sa, sb in segs:
-                        mid = QGraphicsLineItem(
-                            float(sa[0]), float(sa[1]),
-                            float(sb[0]), float(sb[1]),
-                        )
-                        pen = QPen(QColor("#e31a1c"))
-                        pen.setCosmetic(True)
-                        pen.setWidthF(2.0)
-                        mid.setPen(pen)
-                        mid.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-                        mid.setZValue(7)
-                        self.scene.addItem(mid)
-
-            if self.grain_items:
-                self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-40, -40, 40, 40))
 
             hint = QLabel(
-                f"{piece_label}: {len(grains)} possible grain lines (red). "
-                "Click the real grain line, then Continue. "
+                "All pieces with grain/fold marks. "
+                "Click a line to mark/unmark it. "
+                "Selected grain = red, selected fold = purple; pale = off. "
+                "Defaults: single line of a type is on; if several, the longest is on. "
                 "Drag empty area to pan, wheel to zoom."
             )
             hint.setWordWrap(True)
 
-            self.cont = QPushButton("Continue")
-            self.cont.setObjectName("approve")
-            self.cont.setEnabled(False)
+            cont = QPushButton("Continue")
+            cont.setObjectName("approve")
             cancel = QPushButton("Cancel")
-            self.cont.clicked.connect(self.accept)
+            cont.clicked.connect(self.accept)
             cancel.clicked.connect(self.reject)
             row = QHBoxLayout()
             row.addStretch(1)
             row.addWidget(cancel)
-            row.addWidget(self.cont)
+            row.addWidget(cont)
 
             lay = QVBoxLayout(self)
             lay.addWidget(hint)
@@ -3918,22 +3950,20 @@ def resolve_multiple_grains(selected):
                 self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
             )
 
+        def apply_to_pieces(self):
+            for ei, (_fi, _pi, p, lines) in enumerate(self.entries):
+                kept = [
+                    ln for li, ln in enumerate(lines)
+                    if self.selected.get((ei, li), False)
+                ]
+                p["lines"] = kept
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
-
-    n = len(ambiguous)
-    for k, (fi, pi, p, grains) in enumerate(ambiguous):
-        fab_name = (selected["fabrics"][fi].get("name") or f"fabric {fi + 1}")
-        piece_label = f"Fabric “{fab_name}”, piece {pi + 1}"
-        progress = f"{k + 1}/{n}"
-        dlg = PickGrainDialog(p, grains, piece_label, progress)
-        if dlg.exec() != QDialog.Accepted or dlg.chosen is None:
-            return False
-        keep = grains[dlg.chosen]
-        folds = [ln for ln in (p.get("lines") or []) if ln.get("type") == "fold"]
-        # Keep chosen grain + all folds (drop other grains)
-        p["lines"] = [keep] + folds
-
+    dlg = PickLinesDialog(entries)
+    if dlg.exec() != QDialog.Accepted:
+        return False
+    dlg.apply_to_pieces()
     return True
 
 def expand_folds_in_selection(selected, parallel_dot_min=0.92):
@@ -4428,8 +4458,8 @@ def main():
 
     attach_lines_to_selection(selected, lines, tol=20.0)
 
-    if not resolve_multiple_grains(selected):
-        print("Grain selection cancelled – nothing written.")
+    if not resolve_piece_lines(selected):
+        print("Line selection cancelled – nothing written.")
         pattern_doc.close()
         instr_doc.close()
         return
