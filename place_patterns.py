@@ -23,6 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
+import subprocess
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -59,6 +62,22 @@ def label_point_inside(poly, tolerance=0.5):
     except Exception:
         pt = poly.representative_point()
         return (float(pt.x), float(pt.y))
+
+
+def open_file(path: Path) -> None:
+    """Open a file with the OS default app (image viewer for PNG)."""
+    path = Path(path)
+    if not path.is_file():
+        return
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except Exception as e:
+        print(f"(could not open {path.name}: {e})")
 
 # ------------------------------------------------------------------
 # Units
@@ -435,7 +454,7 @@ def draw_layout(fabric_name: str, width_cm: float, length_cm: float,
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Layout PNG → {out_path}")
-
+    open_file(out_path)
 
 def place_from_json(
     data: dict,
