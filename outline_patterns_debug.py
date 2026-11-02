@@ -24,6 +24,8 @@ from shapely.geometry import Point
 from shapely.ops import polygonize, unary_union
 
 import json
+from place_patterns import place_from_json
+
 
 # ------------------------------------------------------------------
 # Multi-page assembly helpers
@@ -4478,10 +4480,21 @@ def main():
         return
 
     step_write_selected(selected, out_dir, stem)
-    
+
     pattern_doc.close()
     instr_doc.close()
-    print("\nDone.")
+    print("\nDone outlining patterns. Continuing to pattern placement.")
+
+    # Pattern placement phase    
+    json_path = out_dir / f"{stem}_selected.json"
+
+    place_from_json(
+        data=json.loads(json_path.read_text(encoding="utf-8")),
+        out_dir=out_dir,          # or out_dir / "placement"
+        stem=stem,
+        gap_cm=1.0,
+        grid_cm=0.5,
+    )    
 
 
 if __name__ == "__main__":
