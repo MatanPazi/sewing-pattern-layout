@@ -4,6 +4,8 @@ outline_patterns_debug.py
 
 How to run:
 python outline_patterns_debug.py --pdf FULL.pdf --pages 0-3
+cmd to generate a single .exe file:
+uv run pyinstaller --noconfirm --clean --name SewingPatternLayout --collect-all PySide6 --collect-all matplotlib --collect-all shapely --collect-all pymupdf --collect-all pikepdf outline_patterns_debug.py
 """
 
 from __future__ import annotations
