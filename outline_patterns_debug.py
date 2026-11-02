@@ -4294,7 +4294,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Choose layers, assemble pages, then debug steps 1–5 + UI"
     )
-    parser.add_argument("--pdf", type=Path, required=True)
+    parser.add_argument(
+        "--pdf",
+        type=Path,
+        default=None,
+        help="Pattern PDF (if omitted, a file dialog is shown)",
+    )
     parser.add_argument("--pages", type=str, default=None, help="e.g. 0-3 or 0,2")
     parser.add_argument("--overlap", type=float, default=0.0)
     parser.add_argument("--out-dir", type=Path, default=None)
@@ -4305,6 +4310,20 @@ def main():
     parser.add_argument("--snap-tol", type=float, default=0.1)
     parser.add_argument("--min-face-area", type=float, default=400.0)
     args = parser.parse_args()
+
+    if args.pdf is None or not args.pdf.is_file():
+        from PySide6.QtWidgets import QApplication, QFileDialog
+
+        app = QApplication.instance() or QApplication([])
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Choose pattern PDF",
+            "",
+            "PDF files (*.pdf);;All files (*.*)",
+        )
+        if not path:
+            raise SystemExit("No PDF chosen")
+        args.pdf = Path(path)
 
     if not args.pdf.is_file():
         raise SystemExit(f"PDF not found: {args.pdf}")
