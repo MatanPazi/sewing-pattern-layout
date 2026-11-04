@@ -4523,4 +4523,16 @@ if __name__ == "__main__":
 
 
 # TODO
+# TODO
 # Handle pdfs with a large # of segments > 10e3. Either handle differently, warn user that this'll take a while, or avoid altogether.
+# Issues with PS_ByrdieButtonup:
+# Missed placket's (#4) length lines (width lines are on another layer, not handling ATM)
+# Completely missed a portion of an outline (#3)
+# Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
+
+# Open initial dialog window instead of choosing a PDF straight away.
+# Try showing text on outlines
+# try to to remove the blue marking of the outline when choosing # of copies
+# In the line selection step only relevant outlines (Those with more than 1 line of the same type)
+# Final cut outlines: show text "These are the selected outlines\nWould you like to go back and change anything before placement?"
+# Part of App window seemed to be hidden by taskbar by default (User had to move window to choose "approve" etc.), make sure that doesn't happen
