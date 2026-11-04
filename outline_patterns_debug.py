@@ -4531,6 +4531,7 @@ if __name__ == "__main__":
 # Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
 
 # Open initial dialog window instead of choosing a PDF straight away.
+# In the choose layers window, add instructions
 # Try showing text on outlines
 # try to to remove the blue marking of the outline when choosing # of copies
 # In the line selection step only relevant outlines (Those with more than 1 line of the same type)
