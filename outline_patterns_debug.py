@@ -567,7 +567,7 @@ def step2_extend_to_first_hit(
     out_dir: Path,
     stem: str,
     max_extension: float = 15.0,
-    hit_eps: float = 0.1,
+    hit_eps: float = 1e-5,
     past_hit: float = 0.05,
     max_rounds: int = 5,
     lateral_tol: float = 1.0,
