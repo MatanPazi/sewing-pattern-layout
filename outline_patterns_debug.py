@@ -562,6 +562,261 @@ def step1_read_and_draw(page, out_dir: Path, stem: str, min_segment_length: floa
 
     return records, all_segments
 
+def step1_5_merge_and_simplify(
+    records,
+    out_dir: Path,
+    stem: str,
+    min_segments_for_merge: int = 1500,
+    endpoint_join: float = 1.5,
+    dash_gap_max: float = 2.0,
+    collinear_dot_min: float = 0.998,
+    lateral_tol: float = 0.75,
+    simplify_dev: float = 0.35,
+):
+    """
+    Step 1.5 – merge fragmented collinear/dash strokes, then light simplify.
+
+    Runs only when total segment count >= min_segments_for_merge so ordinary
+    PDFs are left unchanged.
+
+    Returns (records, all_segments) in the same format as step 1.
+    """
+    segs_in = []
+    for rec in records:
+        segs_in.extend(rec["segments"])
+
+    n_in_seg = len(segs_in)
+    n_in_path = len(records)
+
+    if n_in_seg < min_segments_for_merge:
+        print(
+            f"  step 1.5 skipped "
+            f"(segments={n_in_seg} < threshold={min_segments_for_merge})"
+        )
+        summary_path = out_dir / f"{stem}_step1_5_summary.txt"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write("STEP 1.5 – merge + simplify (SKIPPED)\n")
+            f.write(f"  segments : {n_in_seg}\n")
+            f.write(f"  threshold: {min_segments_for_merge}\n")
+        return records, segs_in
+
+    # --- build undirected segment list with metadata from parent path ---
+    items = []  # dict: a, b, color, width, used
+    for rec in records:
+        for a, b in rec["segments"]:
+            if dist(a, b) < 1e-12:
+                continue
+            items.append({
+                "a": (float(a[0]), float(a[1])),
+                "b": (float(b[0]), float(b[1])),
+                "color": rec.get("color"),
+                "width": rec.get("width"),
+                "used": False,
+            })
+
+    def seg_dir(it):
+        return _unit_dir(it["a"], it["b"])
+
+    def same_style(u, v):
+        return u["color"] == v["color"] and abs(float(u["width"]) - float(v["width"])) < 0.15
+
+    def collinear_pair(u, v):
+        du, dv = seg_dir(u), seg_dir(v)
+        if abs(du[0] * dv[0] + du[1] * dv[1]) < collinear_dot_min:
+            # try flipped
+            if abs(du[0] * (-dv[0]) + du[1] * (-dv[1])) < collinear_dot_min:
+                return False
+        # lateral: endpoints of v near line of u
+        ax, ay = u["a"]
+        d = seg_dir(u)
+        if d == (0.0, 0.0):
+            return False
+
+        def lat(p):
+            return abs((p[0] - ax) * d[1] - (p[1] - ay) * d[0])
+
+        return max(lat(v["a"]), lat(v["b"]), lat(u["a"]), lat(u["b"])) <= lateral_tol
+
+    def end_gap(p, q):
+        return dist(p, q)
+
+    # Grid for neighbour search
+    cell = max(endpoint_join, dash_gap_max, 2.0)
+    grid = defaultdict(list)
+    for i, it in enumerate(items):
+        for p in (it["a"], it["b"]):
+            key = (int(p[0] // cell), int(p[1] // cell))
+            grid[key].append(i)
+
+    def nearby_indices(it):
+        seen = set()
+        out = []
+        for p in (it["a"], it["b"]):
+            cx, cy = int(p[0] // cell), int(p[1] // cell)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for j in grid.get((cx + dx, cy + dy), []):
+                        if j not in seen:
+                            seen.add(j)
+                            out.append(j)
+        return out
+
+    def try_attach(chain_pts, chain_style, cand):
+        """Extend chain_pts (list of points) with cand if collinear join/dash."""
+        if cand["used"]:
+            return False
+        if not same_style(chain_style, cand):
+            return False
+        # synthetic item for collinear test against first chain edge
+        u = {
+            "a": chain_pts[0],
+            "b": chain_pts[-1] if len(chain_pts) > 1 else chain_pts[0],
+            "color": chain_style["color"],
+            "width": chain_style["width"],
+        }
+        # use last segment of chain for direction
+        if len(chain_pts) >= 2:
+            u = {"a": chain_pts[-2], "b": chain_pts[-1],
+                 "color": chain_style["color"], "width": chain_style["width"]}
+        if not collinear_pair(u, cand) and len(chain_pts) >= 2:
+            # also test against first segment (grow backward)
+            u2 = {"a": chain_pts[0], "b": chain_pts[1],
+                  "color": chain_style["color"], "width": chain_style["width"]}
+            if not collinear_pair(u2, cand):
+                return False
+
+        ca, cb = cand["a"], cand["b"]
+        head, tail = chain_pts[0], chain_pts[-1]
+        max_gap = max(endpoint_join, dash_gap_max)
+
+        # match cand ends to chain ends
+        options = [
+            (end_gap(tail, ca), "tail", cb),  # append cb
+            (end_gap(tail, cb), "tail", ca),
+            (end_gap(head, ca), "head", cb),  # prepend cb
+            (end_gap(head, cb), "head", ca),
+        ]
+        options.sort(key=lambda t: t[0])
+        gap, which, other = options[0]
+        if gap > max_gap:
+            return False
+        # collinear enough already checked loosely; accept
+        if which == "tail":
+            if dist(chain_pts[-1], other) > 1e-9:
+                chain_pts.append(other)
+        else:
+            if dist(chain_pts[0], other) > 1e-9:
+                chain_pts.insert(0, other)
+        cand["used"] = True
+        return True
+
+    merged_polylines = []  # list of (points, color, width)
+    for i, it in enumerate(items):
+        if it["used"]:
+            continue
+        it["used"] = True
+        pts = [it["a"], it["b"]]
+        style = {"color": it["color"], "width": it["width"]}
+        changed = True
+        while changed:
+            changed = False
+            # search near head and tail
+            probe = {
+                "a": pts[0], "b": pts[-1],
+                "color": style["color"], "width": style["width"],
+                "used": False,
+            }
+            for j in nearby_indices(probe):
+                if try_attach(pts, style, items[j]):
+                    changed = True
+        merged_polylines.append((pts, style["color"], style["width"]))
+
+    def simplify_polyline(pts, dev):
+        if len(pts) <= 2 or dev <= 0:
+            return pts
+        # iterative drop of near-collinear middle vertices
+        out = [pts[0]]
+        for i in range(1, len(pts) - 1):
+            a, b, c = out[-1], pts[i], pts[i + 1]
+            # distance from b to segment a-c
+            ab = (c[0] - a[0], c[1] - a[1])
+            L = math.hypot(ab[0], ab[1]) or 1.0
+            cross = abs((b[0] - a[0]) * ab[1] - (b[1] - a[1]) * ab[0]) / L
+            if cross > dev:
+                out.append(pts[i])
+        out.append(pts[-1])
+        return out
+
+    new_records = []
+    all_segments = []
+    for pi, (pts, color, width) in enumerate(merged_polylines):
+        pts = simplify_polyline(pts, simplify_dev)
+        if len(pts) < 2:
+            continue
+        segs = []
+        for i in range(len(pts) - 1):
+            if dist(pts[i], pts[i + 1]) > 1e-12:
+                segs.append((pts[i], pts[i + 1]))
+        if not segs:
+            continue
+        length = sum(dist(a, b) for a, b in segs)
+        rec = {
+            "path_id": pi,
+            "color": color,
+            "width": width,
+            "segments": segs,
+            "length": length,
+            "style": (color,),
+        }
+        new_records.append(rec)
+        all_segments.extend(segs)
+
+    # --- summary ---
+    summary_path = out_dir / f"{stem}_step1_5_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("STEP 1.5 – merge collinear/dash + simplify\n")
+        f.write(f"  threshold (min segments): {min_segments_for_merge}\n")
+        f.write(f"  endpoint_join           : {endpoint_join}\n")
+        f.write(f"  dash_gap_max            : {dash_gap_max}\n")
+        f.write(f"  collinear_dot_min       : {collinear_dot_min}\n")
+        f.write(f"  lateral_tol             : {lateral_tol}\n")
+        f.write(f"  simplify_dev            : {simplify_dev}\n")
+        f.write(f"  paths in                : {n_in_path}\n")
+        f.write(f"  segments in             : {n_in_seg}\n")
+        f.write(f"  paths out               : {len(new_records)}\n")
+        f.write(f"  segments out            : {len(all_segments)}\n")
+        if n_in_seg:
+            f.write(
+                f"  segment reduction       : "
+                f"{100.0 * (1.0 - len(all_segments) / n_in_seg):.1f}%\n"
+            )
+    print(f"Step 1.5 summary → {summary_path}")
+    print(
+        f"  merged segments {n_in_seg} → {len(all_segments)}  "
+        f"paths {n_in_path} → {len(new_records)}"
+    )
+
+    # --- PNG ---
+    png_path = out_dir / f"{stem}_step1_5_merged.png"
+    bbox = segments_bbox(all_segments) if all_segments else (0, 0, 1, 1)
+    # reuse step1-style colour plot
+    page_rect_like = type("R", (), {})()
+    page_rect_like.x0, page_rect_like.y0 = bbox[0], bbox[1]
+    page_rect_like.x1, page_rect_like.y1 = bbox[2], bbox[3]
+    _draw_segments_debug(
+        all_segments,
+        new_records,
+        page_rect=page_rect_like,
+        out_path=png_path,
+        title=(
+            f"STEP 1.5 – merged+simplified  "
+            f"seg {n_in_seg}→{len(all_segments)}"
+        ),
+    )
+    print(f"Step 1.5 image   → {png_path}")
+
+    return new_records, all_segments
+
 def step2_extend_to_first_hit(
     records,
     out_dir: Path,
@@ -4311,6 +4566,9 @@ def main():
     parser.add_argument("--path-snap-radius", type=float, default=2.0)
     parser.add_argument("--snap-tol", type=float, default=0.1)
     parser.add_argument("--min-face-area", type=float, default=400.0)
+    parser.add_argument("--min-segments-merge", type=int, default=1500,
+        help="Run step 1.5 only if segment count >= this (default 1500)",
+    )    
     args = parser.parse_args()
 
     if args.pdf is None or not args.pdf.is_file():
@@ -4396,6 +4654,16 @@ def main():
         out_dir=out_dir,
         stem=stem,
         min_segment_length=args.min_seg_length,
+    )
+    print(f"  paths={len(records)}  segments={len(all_segments)}")
+
+    # ----- STEP 1.5 -----
+    print("\n=== STEP 1.5 – merge + simplify (if dense) ===")
+    records, all_segments = step1_5_merge_and_simplify(
+        records,
+        out_dir=out_dir,
+        stem=stem,
+        min_segments_for_merge=getattr(args, "min_segments_merge", 1500),
     )
     print(f"  paths={len(records)}  segments={len(all_segments)}")
 
@@ -4522,7 +4790,6 @@ if __name__ == "__main__":
     main()
 
 
-# TODO
 # TODO
 # Handle pdfs with a large # of segments > 10e3. Either handle differently, warn user that this'll take a while, or avoid altogether.
 # Issues with PS_ByrdieButtonup:
