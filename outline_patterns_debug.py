@@ -3038,7 +3038,6 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                     spin.setRange(1, 99)
                     spin.setFixedWidth(72)
                     spin.setValue(int(previous.get(p.get("source_piece"), 1)))
-                    spin.editingFinished.connect(lambda i=i: self.flash(i))
                     self.badges.append(badge)
                     self.spins.append(spin)
                     self.anchors.append((cx, cy, badge, spin))
@@ -3082,14 +3081,6 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                     spin.move(x + badge.width() // 2 + 6, y - spin.height() // 2)
                     badge.raise_()
                     spin.raise_()
-
-            def flash(self, index):
-                for i, item in enumerate(self.polys):
-                    if item is None:
-                        continue
-                    colour = QColor("#1f6feb" if i == index else "#4c78a8")
-                    colour.setAlpha(210 if i == index else 150)
-                    item.setBrush(QBrush(colour))
 
             def go_back(self):
                 self.went_back = True
@@ -4880,9 +4871,7 @@ if __name__ == "__main__":
 # TODO
 # Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
 
-# In the choose layers window, add instructions
 # Try showing text on outlines
-# try to to remove the blue marking of the outline when choosing # of copies
 # In the line selection step only relevant outlines (Those with more than 1 line of the same type)
 # Final cut outlines: show text "These are the selected outlines\nWould you like to go back and change anything before placement?"
 # Part of App window seemed to be hidden by taskbar by default (User had to move window to choose "approve" etc.), make sure that doesn't happen
