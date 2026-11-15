@@ -3964,14 +3964,9 @@ def _orientation_record_from_fold(fold):
 
 def resolve_piece_lines(selected):
     """
-    Always show a line-picker for all pieces that have any grain/fold.
-    User can mark/unmark any line. Defaults:
-      - one grain  → selected
-      - many grains → longest selected
-      - one fold   → selected
-      - many folds → longest selected
-    Selected grain = red/green family; selected fold = purple.
-    Returns False if cancelled.
+    Line picker only for pieces with more than one grain or more than one fold.
+    If no piece needs a choice, returns True immediately (no dialog).
+    ...
     """
     import sys
     from PySide6.QtCore import Qt, QPointF
@@ -3981,7 +3976,7 @@ def resolve_piece_lines(selected):
         QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
     )
 
-    # Flatten (fab_i, piece_i, piece, lines) for every piece that has lines
+    # Only pieces that need a choice: 2+ grains or 2+ folds
     entries = []
     for fi, fab in enumerate(selected.get("fabrics") or []):
         for pi, p in enumerate(fab.get("pieces") or []):
@@ -3991,10 +3986,14 @@ def resolve_piece_lines(selected):
             ]
             if not lines:
                 continue
+            n_grain = sum(1 for ln in lines if ln.get("type") == "grain")
+            n_fold = sum(1 for ln in lines if ln.get("type") == "fold")
+            if n_grain <= 1 and n_fold <= 1:
+                continue
             entries.append((fi, pi, p, lines))
 
     if not entries:
-        return True
+        return True  # nothing ambiguous → skip this window
 
     def default_selected_indices(lines):
         """Set of indices selected by default."""
@@ -4142,10 +4141,30 @@ def resolve_piece_lines(selected):
             self.view = LineView(self.scene)
 
             def toggle(key):
-                self.selected[key] = not self.selected.get(key, False)
+                ei, li = key
+                lines = self.entries[ei][3]
+                line_type = (lines[li].get("type") or "grain")
+
+                turning_on = not self.selected.get(key, False)
+
+                if line_type == "grain" and turning_on:
+                    # Only one grain active per piece
+                    for other_li, other_ln in enumerate(lines):
+                        if other_li == li:
+                            continue
+                        if (other_ln.get("type") or "") != "grain":
+                            continue
+                        other_key = (ei, other_li)
+                        if self.selected.get(other_key, False):
+                            self.selected[other_key] = False
+                            other_item = self.item_by_key.get(other_key)
+                            if other_item is not None:
+                                other_item.set_selected(False)
+
+                self.selected[key] = turning_on
                 it = self.item_by_key.get(key)
                 if it is not None:
-                    it.set_selected(self.selected[key])
+                    it.set_selected(turning_on)
 
             for ei, (fi, pi, p, lines) in enumerate(entries):
                 pts = p.get("points") or []
@@ -4188,11 +4207,10 @@ def resolve_piece_lines(selected):
                 )
 
             hint = QLabel(
-                "All pieces with grain/fold marks. "
+                "Some outlines seem to have more than 1 line of the same type. Please choose. "
                 "Click a line to mark/unmark it. "
-                "Selected grain = red, selected fold = purple; pale = off. "
-                "Defaults: single line of a type is on; if several, the longest is on. "
-                "Drag empty area to pan, wheel to zoom."
+                "Only one grain can be on per piece. "
+                "Multiple folds can stay on. "
             )
             hint.setWordWrap(True)
 
@@ -4872,6 +4890,5 @@ if __name__ == "__main__":
 # Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
 
 # Try showing text on outlines
-# In the line selection step only relevant outlines (Those with more than 1 line of the same type)
 # Final cut outlines: show text "These are the selected outlines\nWould you like to go back and change anything before placement?"
 # Part of App window seemed to be hidden by taskbar by default (User had to move window to choose "approve" etc.), make sure that doesn't happen
