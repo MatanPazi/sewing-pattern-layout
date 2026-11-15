@@ -4547,6 +4547,89 @@ def preview_final_pieces(selected):
             return False
     return True
 
+def show_landing_and_pick_pdf() -> Path | None:
+    """
+    Landing page with short instructions, then a PDF file dialog.
+    Returns the chosen Path, or None if the user cancels.
+    """
+    import sys
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import (
+        QApplication,
+        QDialog,
+        QFileDialog,
+        QHBoxLayout,
+        QLabel,
+        QPushButton,
+        QVBoxLayout,
+    )
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    class LandingDialog(QDialog):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Sewing Pattern Layout")
+            self.setMinimumWidth(480)
+            self.chosen: Path | None = None
+
+            title = QLabel("Sewing Pattern Layout")
+            title.setStyleSheet("font-size: 20px; font-weight: bold;")
+
+            body = QLabel(
+                "<p>This app reads a sewing-pattern <b>PDF</b>, finds the cut "
+                "outlines, and packs them onto fabric.</p>"
+                "<p><b>What you’ll do:</b></p>"
+                "<ol>"
+                "<li>Choose the pattern PDF.</li>"
+                "<li>Pick the <b>pattern</b> layer and the <b>grain/fold</b> layer.</li>"
+                "<li>Select the pieces you need (and copies).</li>"
+                "<li>Confirm grain / fold lines if asked.</li>"
+                "<li>Review the layout image when packing finishes.</li>"
+                "</ol>"
+                "<p>Outputs (JSON + layout PNG) are written next to the PDF "
+                "in a <code>debug_outline</code> folder.</p>"
+            )
+            body.setWordWrap(True)
+            body.setTextFormat(Qt.TextFormat.RichText)
+
+            btn_open = QPushButton("Choose PDF…")
+            btn_open.setDefault(True)
+            btn_open.setMinimumHeight(36)
+            btn_quit = QPushButton("Quit")
+
+            btn_open.clicked.connect(self._on_open)
+            btn_quit.clicked.connect(self.reject)
+
+            row = QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(btn_quit)
+            row.addWidget(btn_open)
+
+            lay = QVBoxLayout(self)
+            lay.addWidget(title)
+            lay.addWidget(body)
+            lay.addSpacing(12)
+            lay.addLayout(row)
+
+        def _on_open(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Choose pattern PDF",
+                "",
+                "PDF files (*.pdf);;All files (*.*)",
+            )
+            if not path:
+                return
+            self.chosen = Path(path)
+            self.accept()
+
+    dlg = LandingDialog()
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return None
+    return dlg.chosen
+
 def main():
     parser = argparse.ArgumentParser(
         description="Choose layers, assemble pages, then debug steps 1–5 + UI"
@@ -4572,18 +4655,10 @@ def main():
     args = parser.parse_args()
 
     if args.pdf is None or not args.pdf.is_file():
-        from PySide6.QtWidgets import QApplication, QFileDialog
-
-        app = QApplication.instance() or QApplication([])
-        path, _ = QFileDialog.getOpenFileName(
-            None,
-            "Choose pattern PDF",
-            "",
-            "PDF files (*.pdf);;All files (*.*)",
-        )
-        if not path:
+        chosen = show_landing_and_pick_pdf()
+        if chosen is None:
             raise SystemExit("No PDF chosen")
-        args.pdf = Path(path)
+        args.pdf = chosen
 
     if not args.pdf.is_file():
         raise SystemExit(f"PDF not found: {args.pdf}")
@@ -4791,13 +4866,8 @@ if __name__ == "__main__":
 
 
 # TODO
-# Handle pdfs with a large # of segments > 10e3. Either handle differently, warn user that this'll take a while, or avoid altogether.
-# Issues with PS_ByrdieButtonup:
-# Missed placket's (#4) length lines (width lines are on another layer, not handling ATM)
-# Completely missed a portion of an outline (#3)
 # Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
 
-# Open initial dialog window instead of choosing a PDF straight away.
 # In the choose layers window, add instructions
 # Try showing text on outlines
 # try to to remove the blue marking of the outline when choosing # of copies
