@@ -3692,7 +3692,7 @@ def ask_pdf_layers(layers):
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Choose layers")
-            self.resize(460, 220)
+            self.resize(520, 320)
             self.choice = None
             self.pattern_box = QComboBox()
             self.lines_box = QComboBox()
@@ -3720,7 +3720,19 @@ def ask_pdf_layers(layers):
             row.addWidget(cancel)
             row.addWidget(cont)
 
+            hint = QLabel(
+                "Select which PDF layers to use.\n\n"
+                "• Pattern size layer — cut outlines for the size you want "
+                "(often named by size, e.g. “10”, “M”, or “pattern”).\n"
+                "• Grain / fold layer — grain lines, fold marks, and arrows "
+                "(names may include “grain”, “fold”, “lines”, or “guides”).\n\n"
+                "If you’re unsure, keep the suggested defaults and continue."
+            )
+            hint.setWordWrap(True)
+
             lay = QVBoxLayout(self)
+            lay.addWidget(hint)
+            lay.addSpacing(8)
             lay.addWidget(QLabel("Pattern size layer"))
             lay.addWidget(self.pattern_box)
             lay.addWidget(QLabel("Grain / fold layer"))
