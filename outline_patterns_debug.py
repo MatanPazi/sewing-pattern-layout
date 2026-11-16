@@ -4920,5 +4920,4 @@ if __name__ == "__main__":
 # Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
 
 # Try showing text on outlines
-# Final cut outlines: show text "These are the selected outlines\nWould you like to go back and change anything before placement?"
 # Part of App window seemed to be hidden by taskbar by default (User had to move window to choose "approve" etc.), make sure that doesn't happen
