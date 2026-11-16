@@ -4334,7 +4334,12 @@ def expand_folds_in_selection(selected, parallel_dot_min=0.92):
 def preview_final_pieces(selected):
     """
     Show final cut outlines (after folds), one fabric at a time.
-    Returns True if the user continues through all fabrics, False if cancel.
+
+    Returns
+    -------
+    True   – user continued through all fabrics
+    False  – Cancel
+    "back" – user wants to change selection before placement
     """
     import sys
     from PySide6.QtCore import Qt, QPointF
@@ -4512,23 +4517,29 @@ def preview_final_pieces(selected):
                     -40, -40, max_row_w + 80, row_y + row_h + 80
                 )
 
+            self.went_back = False
+
             cont_text = (
-                "Continue" if fi + 1 < n_fabrics else "Continue to save"
+                "Continue" if fi + 1 < n_fabrics else "Continue to placement"
             )
             cont = QPushButton(cont_text)
             cont.setObjectName("approve")
+            back = QPushButton("Back")
             cancel = QPushButton("Cancel")
             cont.clicked.connect(self.accept)
+            back.clicked.connect(self.go_back)
             cancel.clicked.connect(self.reject)
             row = QHBoxLayout()
+            row.addWidget(back)
             row.addStretch(1)
             row.addWidget(cancel)
             row.addWidget(cont)
 
             hint = QLabel(
-                f"Fabric “{name}” ({fi + 1}/{n_fabrics}). "
-                "Dashed purple line = fold axis. "
-                "Drag to pan, wheel to zoom."
+                f"Fabric “{name}” ({fi + 1}/{n_fabrics}).\n"
+                "These are the selected outlines after folds.\n"
+                "Would you like to go back and change anything before placement?\n"
+                "Dashed purple line = fold axis. Drag to pan, wheel to zoom."
             )
             hint.setWordWrap(True)
 
@@ -4558,14 +4569,27 @@ def preview_final_pieces(selected):
                 badge.show()
                 badge.raise_()
 
+        def go_back(self):
+            self.went_back = True
+            self.reject()                
+
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
 
     n = len(fabrics)
-    for fi, fab in enumerate(fabrics):
-        dlg = PreviewDialog(fab, fi, n)
-        if dlg.exec() != QDialog.Accepted:
-            return False
+    fi = 0
+    while fi < n:
+        dlg = PreviewDialog(fabrics[fi], fi, n)
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted:
+            fi += 1
+            continue
+        if getattr(dlg, "went_back", False):
+            if fi > 0:
+                fi -= 1  # previous fabric in multi-fabric preview
+                continue
+            return "back"  # first fabric → change selection upstream
+        return False  # Cancel
     return True
 
 def show_landing_and_pick_pdf() -> Path | None:
@@ -4822,43 +4846,49 @@ def main():
                 f"endpoints={obj['shaft']['endpoints']}\n"
             )        
 
-    print("\n=== Interactive face selection ===")
-    print("Hover highlights a piece. Click selects it.")
-    print("Click again toggles an inner face. Alt-click drops the piece.")
-    print("Drag empty background to pan. Wheel to zoom.")
-    
-    selected = select_faces_pyside6(
-        faces_per_piece,
-        lines,
-        assembled=assembled_pat,
-    )
+    while True:
+        print("\n=== Interactive face selection ===")
+        print("Hover highlights a piece. Click selects it.")
+        print("Click again toggles an inner face. Alt-click drops the piece.")
+        print("Drag empty background to pan. Wheel to zoom.")
 
-    fabrics = selected.get("fabrics", [])
-    print(f"Fabrics: {len(fabrics)}")
-    for fab in fabrics:
-        print(
-            f"  {fab['name']}: width={fab['width']} {fab['width_unit']}  "
-            f"directional={fab['directional']}  pieces={len(fab['pieces'])}"
+        selected = select_faces_pyside6(
+            faces_per_piece,
+            lines,
+            assembled=assembled_pat,
         )
-        for i, p in enumerate(fab["pieces"]):
+
+        fabrics = selected.get("fabrics", [])
+        print(f"Fabrics: {len(fabrics)}")
+        for fab in fabrics:
             print(
-                f"    [{i}] copies={p.get('copies', 1)}  "
-                f"area={p['area']:.0f}  peri={p['perimeter']:.0f}  "
-                f"lines={[ln['type'] for ln in p.get('lines') or []]}"
+                f"  {fab['name']}: width={fab['width']} {fab['width_unit']}  "
+                f"directional={fab['directional']}  pieces={len(fab['pieces'])}"
             )
+            for i, p in enumerate(fab["pieces"]):
+                print(
+                    f"    [{i}] copies={p.get('copies', 1)}  "
+                    f"area={p['area']:.0f}  peri={p['perimeter']:.0f}  "
+                    f"lines={[ln['type'] for ln in p.get('lines') or []]}"
+                )
 
-    attach_lines_to_selection(selected, lines, tol=20.0)
+        attach_lines_to_selection(selected, lines, tol=20.0)
 
-    if not resolve_piece_lines(selected):
-        print("Line selection cancelled – nothing written.")
-        pattern_doc.close()
-        instr_doc.close()
-        return
+        if not resolve_piece_lines(selected):
+            print("Line selection cancelled – nothing written.")
+            pattern_doc.close()
+            instr_doc.close()
+            return
 
-    expand_folds_in_selection(selected)
+        expand_folds_in_selection(selected)
 
-    print("\n=== Final cut outlines (after folds) ===")
-    if not preview_final_pieces(selected):
+        print("\n=== Final cut outlines (after folds) ===")
+        preview_result = preview_final_pieces(selected)
+        if preview_result is True:
+            break
+        if preview_result == "back":
+            print("Going back to piece selection…")
+            continue
         print("Preview cancelled – nothing written.")
         pattern_doc.close()
         instr_doc.close()
