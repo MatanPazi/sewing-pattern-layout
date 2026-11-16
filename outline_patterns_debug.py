@@ -329,6 +329,34 @@ def assemble_pages(pattern_doc, pattern_pages,
 
 # Helpers
 
+def fit_dialog_on_screen(dlg, margin: int = 24) -> None:
+    """
+    Keep dialog fully inside the usable screen (excludes taskbar/dock).
+    Call after resize / setMinimum*, before exec().
+    """
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtCore import QRect
+
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return
+    # Prefer the screen the dialog is on, if already placed
+    win_screen = dlg.screen() if hasattr(dlg, "screen") else None
+    if win_screen is not None:
+        screen = win_screen
+
+    avail: QRect = screen.availableGeometry()
+    max_w = max(320, avail.width() - 2 * margin)
+    max_h = max(240, avail.height() - 2 * margin)
+
+    w = min(dlg.width(), max_w)
+    h = min(dlg.height(), max_h)
+    dlg.resize(w, h)
+
+    x = avail.x() + (avail.width() - w) // 2
+    y = avail.y() + (avail.height() - h) // 2
+    dlg.move(x, y)
+
 def label_point_inside(poly, tolerance=0.5):
     """
     Point suitable for a label: inside the polygon, near the visual center.
@@ -2913,6 +2941,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                 self.accept()
 
         dlg = FabricDialog()
+        fit_dialog_on_screen(dlg)
         if dlg.exec() != QDialog.Accepted:
             return None
         return {
@@ -3090,6 +3119,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
                 return [int(s.value()) for s in self.spins]
 
         dlg = CopiesDialog()
+        fit_dialog_on_screen(dlg)
         if dlg.exec() == QDialog.Accepted:
             return dlg.values()
         if dlg.went_back:
@@ -3114,6 +3144,7 @@ def select_faces_pyside6(faces_per_piece, lines=None, assembled=None):
         remembered_copies = {}
         while True:
             dlg = Picker(subtitle, remembered_active, remembered_off)
+            fit_dialog_on_screen(dlg)
             if dlg.exec() != QDialog.Accepted:
                 return {"fabrics": []}
             remembered_active = set(dlg.active)
@@ -3745,6 +3776,7 @@ def ask_pdf_layers(layers):
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     dlg = LayerDialog()
+    fit_dialog_on_screen(dlg)
     if dlg.exec() != QDialog.Accepted:
         return None
     return dlg.choice
@@ -4246,6 +4278,7 @@ def resolve_piece_lines(selected):
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     dlg = PickLinesDialog(entries)
+    fit_dialog_on_screen(dlg)
     if dlg.exec() != QDialog.Accepted:
         return False
     dlg.apply_to_pieces()
@@ -4580,6 +4613,7 @@ def preview_final_pieces(selected):
     fi = 0
     while fi < n:
         dlg = PreviewDialog(fabrics[fi], fi, n)
+        fit_dialog_on_screen(dlg)
         result = dlg.exec()
         if result == QDialog.DialogCode.Accepted:
             fi += 1
@@ -4671,6 +4705,7 @@ def show_landing_and_pick_pdf() -> Path | None:
             self.accept()
 
     dlg = LandingDialog()
+    fit_dialog_on_screen(dlg)
     if dlg.exec() != QDialog.DialogCode.Accepted:
         return None
     return dlg.chosen
