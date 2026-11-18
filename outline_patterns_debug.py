@@ -1601,6 +1601,245 @@ def step5_polygonize(noded, out_dir: Path, stem: str, min_face_area: float = 400
     print(f"Step 5 image   → {png_path}")
     return faces
 
+def _seg_key(a, b, tol=0.5):
+    """Order-independent quantized key for segment dedup / exclusion."""
+    ax, ay = round(a[0] / tol), round(a[1] / tol)
+    bx, by = round(b[0] / tol), round(b[1] / tol)
+    if (ax, ay) <= (bx, by):
+        return (ax, ay, bx, by)
+    return (bx, by, ax, ay)
+
+
+def collect_page_stroke_segments(page, min_seg_length: float = 0.5):
+    """All stroked segments from a page-like object (e.g. lines layer)."""
+    segs = []
+    for path in page.get_drawings():
+        color = path.get("color")
+        width = float(path.get("width") or 0.0)
+        if color is None and width <= 0:
+            continue
+        for a, b in path_to_segments(path, n_bezier=16):
+            if dist(a, b) >= min_seg_length:
+                segs.append((
+                    (float(a[0]), float(a[1])),
+                    (float(b[0]), float(b[1])),
+                ))
+    return segs
+
+
+def special_line_segment_keys(lines, tol=0.5):
+    """Keys for grain/fold shafts, arrows, and crossbars — not option candidates."""
+    keys = set()
+    for obj in lines or []:
+        sh = obj.get("shaft") or {}
+        for a, b in sh.get("segments") or []:
+            keys.add(_seg_key(a, b, tol))
+        for arr in obj.get("arrows") or []:
+            for a, b in arr.get("segments") or []:
+                keys.add(_seg_key(a, b, tol))
+        for bar in obj.get("crossbars") or []:
+            # crossbars may be runs with terminals or raw segments
+            if isinstance(bar, dict) and "segments" in bar:
+                for a, b in bar["segments"]:
+                    keys.add(_seg_key(a, b, tol))
+            elif isinstance(bar, dict) and "terminals" in bar:
+                t = bar["terminals"]
+                if len(t) >= 2:
+                    keys.add(_seg_key(t[0], t[1], tol))
+    return keys
+
+
+def split_faces_with_lines_layer_options(
+    faces,
+    page_lines,
+    special_lines,
+    out_dir: Path,
+    stem: str,
+    min_face_area: float = 400.0,
+    boundary_tol: float = 8.0,
+    min_inside_frac: float = 0.5,
+    min_rel_length: float = 0.12,
+    snap_tol: float = 0.15,
+):
+    """
+    Option B: non-grain/fold strokes on the lines layer that lie inside a face
+    and meet the boundary at both ends split that face (like pattern-layer
+    length options). Uses shapely.ops.split so mid-edge T-junctions work.
+    """
+    from shapely.geometry import LineString, Point
+    from shapely.ops import unary_union, split as shp_split
+
+    raw_segs = collect_page_stroke_segments(page_lines)
+    used = special_line_segment_keys(special_lines)
+    candidates = [s for s in raw_segs if _seg_key(s[0], s[1]) not in used]
+
+    if not faces or not candidates:
+        print("  step 5b: no faces or no candidate option segments")
+        return faces
+
+    def near_boundary(pt, poly, tol):
+        return poly.exterior.distance(Point(pt[0], pt[1])) <= tol
+
+    def poly_to_face(poly):
+        coords = list(poly.exterior.coords)
+        return {
+            "polygon": poly,
+            "points": coords[:-1],
+            "area": float(poly.area),
+            "bbox": poly.bounds,
+            "perimeter": float(poly.length),
+        }
+
+    out_faces = []
+    n_split = 0
+    events = []
+    n_fail_len = n_fail_inside = n_fail_boundary = n_pass = 0
+
+    for fi, face in enumerate(faces):
+        poly = face["polygon"]
+        if poly is None or poly.is_empty or poly.geom_type != "Polygon":
+            out_faces.append(face)
+            continue
+
+        bw = float(poly.bounds[2] - poly.bounds[0])
+        bh = float(poly.bounds[3] - poly.bounds[1])
+        # Short side — length options often span width of a tall piece
+        min_len = max(5.0, min_rel_length * min(bw, bh))
+
+        opts = []
+        for a, b in candidates:
+            ls = LineString([a, b])
+            if ls.length < min_len:
+                n_fail_len += 1
+                continue
+            try:
+                inter = ls.intersection(poly)
+            except Exception:
+                n_fail_inside += 1
+                continue
+            if inter.is_empty:
+                n_fail_inside += 1
+                continue
+            inside_len = float(getattr(inter, "length", 0.0) or 0.0)
+            if inside_len < min_len * 0.5:
+                n_fail_inside += 1
+                continue
+
+            # Ends of the *part inside the face* must lie on the outline
+            inter_ends = []
+            if inter.geom_type == "LineString":
+                c = list(inter.coords)
+                if len(c) >= 2:
+                    inter_ends = [c[0], c[-1]]
+            elif inter.geom_type == "MultiLineString":
+                for g in inter.geoms:
+                    c = list(g.coords)
+                    if len(c) >= 2:
+                        inter_ends.extend([c[0], c[-1]])
+
+            if len(inter_ends) < 2:
+                n_fail_inside += 1
+                continue
+
+            # Use the two farthest ends of the intersection as the chord
+            # (handles MultiLineString debris)
+            best_a, best_b = inter_ends[0], inter_ends[-1]
+            best_d = dist(best_a, best_b)
+            for i in range(len(inter_ends)):
+                for j in range(i + 1, len(inter_ends)):
+                    d = dist(inter_ends[i], inter_ends[j])
+                    if d > best_d:
+                        best_d = d
+                        best_a, best_b = inter_ends[i], inter_ends[j]
+
+            if best_d < min_len * 0.5:
+                n_fail_inside += 1
+                continue
+
+            if not (
+                near_boundary(best_a, poly, boundary_tol)
+                and near_boundary(best_b, poly, boundary_tol)
+            ):
+                n_fail_boundary += 1
+                continue
+
+            opts.append((best_a, best_b))
+            n_pass += 1
+
+        if not opts:
+            out_faces.append(face)
+            continue
+
+        # Extend slightly past the boundary so the cut fully crosses the face
+        cut_lines = []
+        pad = max(boundary_tol, 1.0)
+        for a, b in opts:
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            L = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / L, dy / L
+            a2 = (a[0] - ux * pad, a[1] - uy * pad)
+            b2 = (b[0] + ux * pad, b[1] + uy * pad)
+            cut_lines.append(LineString([a2, b2]))
+
+        try:
+            cutter = (
+                cut_lines[0] if len(cut_lines) == 1 else unary_union(cut_lines)
+            )
+            parts = shp_split(poly, cutter)
+        except Exception as e:
+            events.append(f"face[{fi}] split failed: {e}")
+            out_faces.append(face)
+            continue
+
+        sub = []
+        for p in parts.geoms:
+            if p.geom_type != "Polygon" or p.is_empty:
+                continue
+            if p.area < min_face_area:
+                continue
+            sub.append(poly_to_face(p))
+
+        if len(sub) >= 2:
+            out_faces.extend(sub)
+            n_split += 1
+            events.append(
+                f"face[{fi}] area={face['area']:.0f} → {len(sub)} subfaces "
+                f"(opts={len(opts)})"
+            )
+        else:
+            out_faces.append(face)
+            events.append(
+                f"face[{fi}] opts={len(opts)} but split yielded {len(sub)} part(s)"
+            )
+
+    out_faces.sort(key=lambda f: f["area"], reverse=True)
+
+    summary_path = out_dir / f"{stem}_step5b_options_summary.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("STEP 5b – split faces by lines-layer length options\n")
+        f.write(f"  candidate segs (non grain/fold): {len(candidates)}\n")
+        f.write(f"  faces in                     : {len(faces)}\n")
+        f.write(f"  faces out                    : {len(out_faces)}\n")
+        f.write(f"  faces split                  : {n_split}\n")
+        f.write(f"  boundary_tol                 : {boundary_tol}\n")
+        f.write(f"  min_inside_frac              : {min_inside_frac}\n")
+        f.write(f"  min_rel_length               : {min_rel_length}\n")
+        f.write(f"  reject length                : {n_fail_len}\n")
+        f.write(f"  reject inside                : {n_fail_inside}\n")
+        f.write(f"  reject boundary              : {n_fail_boundary}\n")
+        f.write(f"  opts accepted                : {n_pass}\n")
+        for line in events:
+            f.write(f"  {line}\n")
+    print(f"Step 5b summary → {summary_path}")
+    print(
+        f"  faces {len(faces)} → {len(out_faces)}  (split {n_split} face(s))"
+    )
+
+    png_path = out_dir / f"{stem}_step5b_faces.png"
+    _draw_faces_debug(out_faces, png_path)
+    print(f"Step 5b image   → {png_path}")
+
+    return out_faces
 
 def step_write_selected(selected, out_dir: Path, stem: str):
     import json
@@ -4862,6 +5101,17 @@ def main():
     )
     print(f"  faces={len(faces)}")
 
+    print("\n=== STEP 5b – length options from lines layer ===")
+    faces = split_faces_with_lines_layer_options(
+        faces,
+        page_lines,
+        lines,  # grain/fold already detected
+        out_dir=out_dir,
+        stem=stem,
+        min_face_area=args.min_face_area,
+    )
+    print(f"  faces after options={len(faces)}")
+
     faces_per_piece = group_faces_into_pieces(faces)
     print(f"  pieces={len(faces_per_piece)}")
     for pi, fl in faces_per_piece:
@@ -4955,4 +5205,4 @@ if __name__ == "__main__":
 # Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
 
 # Try showing text on outlines
-# Part of App window seemed to be hidden by taskbar by default (User had to move window to choose "approve" etc.), make sure that doesn't happen
+# Test window partly hidden by taskbar (Allegedly fixed)
