@@ -5202,7 +5202,8 @@ if __name__ == "__main__":
 
 
 # TODO
-# Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
 
 # Try showing text on outlines
+# Direction of outline was wrong, need to infer orientation (Up/down) or ask user?
+    # If a directional fabric was chosen, for that fabric alone, for each outline piece, the user must orient the piece in the correct orientation.
 # Test window partly hidden by taskbar (Allegedly fixed)
