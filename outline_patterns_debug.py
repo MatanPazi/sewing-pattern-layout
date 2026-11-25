@@ -4692,8 +4692,7 @@ def preview_final_pieces(selected):
             self.resize(1200, 850)
 
             self.scene = QGraphicsScene(self)
-            self.view = PreviewView(self.scene, on_view_changed=self.place_badges)
-            self.badges = []
+            self.view = PreviewView(self.scene, on_view_changed=None)
 
             gap = 40.0
             cursor_x = 0.0
@@ -4776,13 +4775,20 @@ def preview_final_pieces(selected):
                         line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
                         self.scene.addItem(line)
 
-                badge = QLabel(label, self.view.viewport())
-                badge.setStyleSheet(
-                    "background:#1f6feb; color:white; border-radius:8px; "
-                    "font-weight:700; font-size:12px; padding:3px 8px;"
+                from PySide6.QtWidgets import QGraphicsSimpleTextItem
+                text_item = QGraphicsSimpleTextItem(label)
+                text_item.setBrush(QBrush(QColor("#1f6feb")))
+                font = text_item.font()
+                font.setBold(True)
+                font.setPointSize(11)
+                text_item.setFont(font)
+                text_item.setZValue(20)
+                text_item.setFlag(
+                    text_item.GraphicsItemFlag.ItemIgnoresTransformations, True
                 )
-                badge.adjustSize()
-                self.badges.append((cx, cy, badge))
+                br = text_item.boundingRect()
+                text_item.setPos(cx - br.width() / 2.0, cy - br.height() / 2.0)
+                self.scene.addItem(text_item)
 
             if placed:
                 self.scene.setSceneRect(
@@ -4822,28 +4828,16 @@ def preview_final_pieces(selected):
 
         def showEvent(self, event):
             super().showEvent(event)
-            self.view.fitInView(
-                self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
-            )
-            self.place_badges()
-
-        def resizeEvent(self, event):
-            super().resizeEvent(event)
-            self.place_badges()
-
-        def place_badges(self):
-            for cx, cy, badge in self.badges:
-                pt = self.view.mapFromScene(QPointF(cx, cy))
-                badge.move(
-                    int(pt.x()) - badge.width() // 2,
-                    int(pt.y()) - badge.height() // 2,
+            try:
+                self.view.fitInView(
+                    self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
                 )
-                badge.show()
-                badge.raise_()
+            except Exception as e:
+                print(f"  preview fitInView: {e}", flush=True)
 
         def go_back(self):
             self.went_back = True
-            self.reject()                
+            self.reject()              
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -4851,9 +4845,20 @@ def preview_final_pieces(selected):
     n = len(fabrics)
     fi = 0
     while fi < n:
+        print(f"  preview: build dialog fabric {fi + 1}/{n}…", flush=True)
         dlg = PreviewDialog(fabrics[fi], fi, n)
-        fit_dialog_on_screen(dlg)
+        print("  preview: before fit", flush=True)
+        try:
+            fit_dialog_on_screen(dlg)
+        except Exception as e:
+            print(f"  fit_dialog_on_screen: {e}", flush=True)
+        print("  preview: before exec", flush=True)
         result = dlg.exec()
+        print(
+            f"  preview: after exec result={int(result)} "
+            f"went_back={getattr(dlg, 'went_back', None)}",
+            flush=True,
+        )
         if result == QDialog.DialogCode.Accepted:
             fi += 1
             continue
